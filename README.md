@@ -1,6 +1,8 @@
 # AEGIS: Adaptive Environment Graph Identification System
 
-![aegis_logo](data/aegis.gif)
+<p align="center">
+  <img src="data/aegis.gif" alt="AEGIS logo" width="256"/>
+</p>
 
 **Adaptive Environment Graph Hierarchies via Dynamic Anchor Selection**
 
@@ -12,7 +14,7 @@
 
 ## Overview
 
-AHEAD addresses the fundamental limitation of current hierarchical scene graph methods: their reliance on fixed, environment-specific schemas (e.g., floor→room→object). We propose a framework for **dynamic anchor object identification** that enables adaptive hierarchical knowledge graph construction across heterogeneous environments.
+AEGIS addresses the fundamental limitation of current hierarchical scene graph methods: their reliance on fixed, environment-specific schemas (e.g., floor→room→object). We propose a framework for **dynamic anchor object identification** that enables adaptive hierarchical knowledge graph construction across heterogeneous environments.
 
 ### Key Contributions
 
@@ -26,7 +28,7 @@ AHEAD addresses the fundamental limitation of current hierarchical scene graph m
 ## Architecture
 
 <p align="center">
-  <img src="assets/pipeline.png" alt="AHEAD Pipeline" width="800"/>
+  <img src="data/anchor_db_v2.png" alt="AEGIS Pipeline" width="800"/>
 </p>
 
 Our pipeline integrates VL-KnG baseline for knowledge graph construction with visual feature extraction (SAM + RADIO-2 + Florence-2) to identify anchor objects and assemble adaptive hierarchies.
@@ -82,19 +84,20 @@ Downstream task evaluation on:
 
 ```bash
 # Clone repository
-git clone https://github.com/your-username/AHEAD.git
-cd AHEAD
+git clone https://github.com/your-username/AEGIS.git
+cd AEGIS
 
 # Create conda environment
-conda create -n ahead python=3.10
-conda activate ahead
+uv venv --python 3.12 --prompt vizEnc
+source .venv/bin/activate
+uv sync
 
-# Install dependencies
-pip install -r requirements.txt
+git clone git@github.com:facebookresearch/segment-anything.git
+git clone git@github.com:RayFronts/RayFronts.git
 
 # Install VL-KnG baseline
 git clone https://github.com/VL-KnG/VL-KnG.git
-cd VL-KnG && pip install -e .
+cd VL-KnG && uv pip install -e .
 ```
 
 ---
@@ -102,37 +105,87 @@ cd VL-KnG && pip install -e .
 ## Quick Start
 
 ```python
-from ahead import AnchorIdentifier, HierarchyBuilder
+from pathlib import Path
+from PIL import Image
+import numpy as np
 
-# Initialize anchor identifier with your preferred strategy
-identifier = AnchorIdentifier(strategy='vlm')  # or 'frequency', 'visual'
+# === 1. Initialize Models ===
+from segmentation.sam import init_sam
+from encoders.naradio import load_naradio_encoder
+from encoders.florence import load_florence_model
 
-# Process RGB observations
-anchors = identifier.identify_anchors(rgb_frames)
+project_dir = Path.cwd()
+device = "cuda"
 
-# Build adaptive hierarchy
-hierarchy_builder = HierarchyBuilder()
-knowledge_graph = hierarchy_builder.build(anchors, objects)
+# SAM for segmentation
+mask_generator = init_sam(project_dir, version='sam1', device=device)
 
-# Use for downstream tasks
-result = knowledge_graph.query("Find the red chair near the table")
+# RADIO for visual embeddings
+visual_encoder = load_naradio_encoder(project_dir, device=device)
+
+# Florence-2 for object descriptions
+florence_model, florence_processor = load_florence_model(device=device)
+
+# === 2. Process Frames with vizEnc ===
+from vizenc_utils.anchors import create_anchor_db, update_anchors
+from vizenc_utils.matching import optimal_match_objects
+from processing import process_masks_with_features, filter_masks
+
+anchor_db = create_anchor_db()
+frames = sorted(Path("data/your_scene/frames").glob("*.png"))
+
+for frame_idx, frame_path in enumerate(frames):
+    image = Image.open(frame_path).convert("RGB")
+    masks = mask_generator.generate(np.array(image))
+    masks = process_masks_with_features(image, masks, config, models)
+    masks = filter_masks(masks, image.size, filter_config)
+    update_anchors(anchor_db, frame_idx, masks, ...)
+
+# === 3. Run vl-kgp for Semantic Graph ===
+from vl_kgp.core.efficient_chunk_object_detection import EfficientChunkObjectDetector
+
+detector = EfficientChunkObjectDetector(api_provider, chunk_size=8)
+vlkgp_result = detector.detect_chunk(frame_paths)
+# Returns: objects with descriptions + spatial_relationships
+
+# === 4. Combine: Match Anchors with vl-kgp Objects ===
+from vizenc_utils.matching import iou_match_objects
+from vizenc_utils.bbox_utils import compute_iou
+
+# Match by IoU + category similarity per frame
+unified_objects = combine_results(anchor_db, vlkgp_result, config={
+    'iou_weight': 0.6,
+    'category_weight': 0.4,
+    'score_threshold': 0.3
+})
+
+# Result: unified objects with both visual embeddings AND text descriptions
 ```
+
+See `src/combination.ipynb` for the complete pipeline.
 
 ---
 
 ## Project Structure
 
 ```
-AHEAD/
-├── ahead/
-│   ├── anchor_selection/      # Anchor identification strategies
-│   ├── hierarchy_assembly/    # Adaptive hierarchy construction
-│   ├── baselines/             # VL-KnG integration
-│   └── evaluation/            # Benchmark evaluation scripts
-├── configs/                   # Configuration files
-├── data/                      # Dataset loaders
-├── scripts/                   # Training and evaluation scripts
-└── notebooks/                 # Jupyter notebooks for visualization
+AEGIS/
+├── src/
+│   ├── encoders/              # Visual encoders (DINOv2, RADIO, Florence-2)
+│   ├── segmentation/          # SAM integration
+│   ├── vizenc_utils/          # Anchor tracking, matching, visualization
+│   │   ├── anchors.py         # Anchor database management
+│   │   ├── matching.py        # IoU & embedding matching algorithms
+│   │   ├── bbox_utils.py      # Bounding box utilities
+│   │   └── visualization.py   # Mask & anchor visualization
+│   ├── processing.py          # Feature extraction pipeline
+│   ├── combination.ipynb      # Full vizEnc + vl-kgp pipeline
+│   └── output/                # Exported unified chunks
+├── vl-kgp/                    # VL-KnG baseline (submodule)
+├── segment-anything/          # SAM (submodule)
+├── RayFronts/                 # RADIO encoder (submodule)
+├── data/                      # Input frames and datasets
+└── configs/                   # Configuration files
 ```
 
 ---
@@ -152,7 +205,7 @@ Comprehensive evaluation results coming soon.
 ## Citation
 
 ```bibtex
-@mastersthesis{fatykhoph2025ahead,
+@mastersthesis{fatykhoph2025AEGIS,
   title={Adaptive Environment Graph Hierarchies via Dynamic Anchor Selection},
   author={Fatykhoph, Denis},
   year={2025},
