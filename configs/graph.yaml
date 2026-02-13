@@ -1,0 +1,16 @@
+# VizEnc Graph Configuration
+
+# ========== INNER EDGES (Spatial Relations) ==========
+inner:
+  proximity_threshold: 200  # pixels - connect objects closer than this
+
+# ========== INTER EDGES (Temporal Tracking) ==========
+inter:
+  similarity_threshold: 0.7  # Minimum cosine similarity for tracking
+
+# ========== GRAPH EXPORT ==========
+export:
+  include_segmentation: false  # Include binary masks in JSON export
+  include_embedding: true      # Include embeddings in JSON export
+  neo4j:
+    batch_size: 1000  # Batch size for Neo4j import
