@@ -23,7 +23,8 @@ def create_anchor_db():
 
 
 def update_anchors(anchor_db, frame_idx, current_masks, prev_masks, matches,
-                   threshold=0.7, averaging_method='mean', ema_alpha=0.3):
+                   threshold=0.7, averaging_method='mean', ema_alpha=0.3,
+                   skip_reidentification=False):
     """
     Update anchor database with new frame observations.
 
@@ -44,6 +45,8 @@ def update_anchors(anchor_db, frame_idx, current_masks, prev_masks, matches,
         threshold: Similarity threshold for anchor matching
         averaging_method: 'mean' or 'ema' for embedding averaging
         ema_alpha: Alpha parameter for EMA (0-1, only used if method='ema')
+        skip_reidentification: If True, skip re-identification and create new anchors
+                              for all unmatched objects (useful for first frame)
 
     Returns:
         None (modifies anchor_db in-place)
@@ -115,29 +118,34 @@ def update_anchors(anchor_db, frame_idx, current_masks, prev_masks, matches,
         if curr_idx in assigned_current:
             continue  # Already assigned
 
-        # Try to match with all anchors
-        curr_emb = curr_mask['embedding']
-        best_track_id = None
-        best_sim = threshold
-
-        for track_id, anchor in anchors.items():
-            anchor_emb = anchor['embedding']
-            sim = cosine_similarity([curr_emb], [anchor_emb])[0][0]
-
-            if sim > best_sim:
-                best_sim = sim
-                best_track_id = track_id
-
-        if best_track_id is not None:
-            # RE-IDENTIFICATION - Revive anchor
-            anchor = anchors[best_track_id]
-            _update_anchor(anchor, curr_mask, frame_idx, best_sim,
-                          averaging_method, ema_alpha)
-            curr_mask['track_id'] = best_track_id
-        else:
-            # NEW OBJECT - Create new anchor
+        if skip_reidentification:
+            # Skip re-identification (for first frame) - always create new anchor
             track_id = _create_new_anchor(anchor_db, curr_mask, frame_idx, 1.0)
             curr_mask['track_id'] = track_id
+        else:
+            # Try to match with all anchors
+            curr_emb = curr_mask['embedding']
+            best_track_id = None
+            best_sim = threshold
+
+            for track_id, anchor in anchors.items():
+                anchor_emb = anchor['embedding']
+                sim = cosine_similarity([curr_emb], [anchor_emb])[0][0]
+
+                if sim > best_sim:
+                    best_sim = sim
+                    best_track_id = track_id
+
+            if best_track_id is not None:
+                # RE-IDENTIFICATION - Revive anchor
+                anchor = anchors[best_track_id]
+                _update_anchor(anchor, curr_mask, frame_idx, best_sim,
+                              averaging_method, ema_alpha)
+                curr_mask['track_id'] = best_track_id
+            else:
+                # NEW OBJECT - Create new anchor
+                track_id = _create_new_anchor(anchor_db, curr_mask, frame_idx, 1.0)
+                curr_mask['track_id'] = track_id
 
 
 def _create_new_anchor(anchor_db, mask, frame_idx, confidence):
