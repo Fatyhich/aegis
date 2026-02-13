@@ -1,0 +1,59 @@
+# VizEnc Models Configuration
+
+# ========== SAM CONFIGURATION ==========
+sam:
+  version: "sam1"  # 'sam1' or 'sam2'
+  checkpoint_path: null  # Will auto-download if not specified
+  model_type: "vit_h"  # SAM 1 only: 'vit_h', 'vit_l', 'vit_b'
+  points_per_side: 8
+  pred_iou_thresh: 0.95
+
+# ========== ENCODER CONFIGURATION ==========
+encoder:
+  type: "naradio"  # 'dinov2' or 'naradio'
+
+  # DINOv2 settings
+  dinov2:
+    model_name: "facebook/dinov2-base"
+    target_size: [224, 224]
+
+  # NaRadIO settings
+  naradio:
+    version: "radio_v2.5-b"  # 'radio_v2.5-b', 'radio_v2.5-l', 'radio_v2.5-g'
+    lang_model: "siglip"  # 'clip' or 'siglip'
+    resolution: [512, 512]
+
+# ========== FLORENCE-2 CONFIGURATION ==========
+florence:
+  enabled: true
+  model_name: "microsoft/Florence-2-large-ft"
+
+# ========== ZERO-SHOT CONFIGURATION (NaRadIO only) ==========
+zero_shot:
+  enabled: true
+  labels:
+    - "person"
+    - "building"
+    - "tree"
+    - "grass"
+    - "sky"
+    - "ground"
+    - "ceiling"
+    - "floor"
+    - "column"
+    - "statue"
+    - "bench"
+    - "wall"
+    - "window"
+    - "door"
+    - "car"
+    - "bicycle"
+    - "road"
+    - "path"
+    - "water"
+    - "fountain"
+    - "pedestrian"
+    - "human"
+    - "walker"
+    - "man"
+    - "shadow"

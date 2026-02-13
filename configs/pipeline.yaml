@@ -1,0 +1,50 @@
+# VizEnc Pipeline Configuration
+
+# ========== DATA CONFIGURATION ==========
+data:
+  dataset_name: "scand_cafe"
+  frames_dir: "/workspace/data/scand_spot_cafe/output_frames_4hz"
+  start_frame: 0
+  chunk_size: 8  # frames per chunk
+  # max_chunks: null  # null = process all frames, or set integer to limit
+
+# ========== FILTERING CONFIGURATION ==========
+filtering:
+  enabled: true
+  excluded_categories:
+    - "pedestrian"
+    - "person"
+    - "human"
+    - "walker"
+    - "man"
+    - "woman"
+    - "shadow"
+    - "people"
+    - "child"
+    - "kid"
+  min_mask_ratio: 0.1  # Minimum 10% of image area
+
+# ========== MATCHING CONFIGURATION ==========
+matching:
+  algorithm: "hungarian"  # 'greedy' or 'hungarian'
+  threshold: 0.7
+
+# ========== ANCHOR CONFIGURATION ==========
+anchors:
+  enabled: true
+  averaging_method: "mean"  # 'mean' or 'ema'
+  ema_alpha: 0.3
+  threshold: 0.7
+
+# ========== PROCESSING CONFIGURATION ==========
+processing:
+  use_batch: false
+  batch_size: 8
+
+# ========== OUTPUT CONFIGURATION ==========
+output:
+  output_dir: "output/chunks"
+  export_formats:
+    - "pkl"
+    - "json"
+    - "neo4j"
