@@ -1,0 +1,114 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyc
+*.pyo
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+segmast3r/
+segment-anything/
+vl-kgp/
+RayFronts/
+data/
+
+nvidia-uvm
+nvidia-uvm-tools
+nvidia0
+nvidiactl
+
+# Окружения и зависимости
+venv/
+env/
+.venv/
+.env/
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Virtualenvwrapper
+.python-version
+.venv-*
+
+# IDE и редакторы
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+*.swn~
+*.code-workspace
+
+# Тесты и покрытие
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+coverage.*
+.pytest_cache/
+tox/
+.nox/
+
+# Сборка и дистрибутивы
+build/
+dist/
+*.egg
+*.egg-info/
+*.eggs/
+MANIFEST
+
+# Логи и временные файлы
+*.log
+*.logs/
+logs/
+*.tmp
+*.bak
+*.backup
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# Данные и большие файлы
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+data/
+*.pickle
+*.pkl
+*.joblib
+
+# Output and results directories
+output/
+src/output/
+src/results/
+visualization/output/
+
+# Root-level generated images
+bbox_vlkng.png
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+
+# Документация и автогенерация
+docs/_build/
+site/
+
+# Дополнительно (часто забывают)
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+.pyright/
