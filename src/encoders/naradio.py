@@ -49,12 +49,17 @@ def get_naradio_embedding(image_crop, encoder):
     Extract global embedding vector from NaRadIO for a single image crop.
 
     Args:
-        image_crop: PIL Image
+        image_crop: PIL Image (RGB or RGBA)
         encoder: NARadioEncoder instance
 
     Returns:
         numpy array of shape (D,) - embedding vector
     """
+    # Convert RGBA to RGB if needed
+    if image_crop.mode == 'RGBA':
+        bg = image_crop.convert('RGB')
+        image_crop = bg
+
     # NaRadIO requires fixed input size - resize crop to match encoder resolution
     target_size = tuple(encoder.input_resolution)  # (H, W)
     image_crop = image_crop.resize((target_size[1], target_size[0]))  # PIL uses (W, H)
@@ -76,20 +81,29 @@ def get_naradio_embeddings_batch(image_crops, encoder, batch_size=8):
     Extract embeddings for multiple image crops in batches.
 
     Args:
-        image_crops: List of PIL Images
+        image_crops: List of PIL Images (RGB or RGBA)
         encoder: NARadioEncoder instance
         batch_size: Number of images to process at once
 
     Returns:
         List of numpy arrays - embedding vectors
     """
+    # Convert RGBA to RGB if needed
+    rgb_crops = []
+    for crop in image_crops:
+        if crop.mode == 'RGBA':
+            bg = crop.convert('RGB')
+            rgb_crops.append(bg)
+        else:
+            rgb_crops.append(crop)
+
     # NaRadIO requires fixed input size
     target_size = tuple(encoder.input_resolution)  # (H, W)
 
     embeddings = []
 
-    for i in range(0, len(image_crops), batch_size):
-        batch_crops = image_crops[i:i + batch_size]
+    for i in range(0, len(rgb_crops), batch_size):
+        batch_crops = rgb_crops[i:i + batch_size]
 
         # Convert batch of PIL images to tensor
         batch_tensors = []
@@ -115,13 +129,18 @@ def naradio_zero_shot_classify(image_crop, encoder, candidate_labels):
     Zero-shot classification using NaRadIO language alignment.
 
     Args:
-        image_crop: PIL Image
+        image_crop: PIL Image (RGB or RGBA)
         encoder: NARadioEncoder instance
         candidate_labels: List of text labels (e.g., ["person", "building", "tree"])
 
     Returns:
         Tuple of (best_label, confidence_score)
     """
+    # Convert RGBA to RGB if needed
+    if image_crop.mode == 'RGBA':
+        bg = image_crop.convert('RGB')
+        image_crop = bg
+
     # NaRadIO requires fixed input size - resize crop to match encoder resolution
     target_size = tuple(encoder.input_resolution)  # (H, W)
     image_crop = image_crop.resize((target_size[1], target_size[0]))  # PIL uses (W, H)
