@@ -5,6 +5,8 @@ Visualization utilities for object segmentation and tracking.
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from PIL import Image
+from pathlib import Path
 
 
 def show_anns(anns, borders=True):
@@ -264,3 +266,148 @@ def visualize_anchor(anchor_db, track_id, mask_db, frames_paths):
 
     plt.tight_layout()
     plt.show()
+
+
+def build_vlkgp_frame_index(vlkgp_results):
+    """
+    Build a frame-indexed database from vl-kgp results.
+
+    Args:
+        vlkgp_results: Dict with 'objects' and 'image_paths' from vl-kgp pipeline.
+
+    Returns:
+        Dict mapping frame_index -> list of objects with their bboxes for that frame.
+        Also includes 'image_paths' for path lookup.
+    """
+    frame_index_db = {
+        'image_paths': vlkgp_results.get('image_paths', []),
+        'frames': {}
+    }
+
+    for obj in vlkgp_results.get('objects', []):
+        obj_id = obj.get('id', 'unknown')
+        obj_name = obj.get('name', 'unknown')
+        obj_description = obj.get('description', {})
+
+        for frame_info in obj.get('frames', []):
+            fidx = frame_info.get('frame_index')
+            if fidx is None:
+                continue
+
+            if fidx not in frame_index_db['frames']:
+                frame_index_db['frames'][fidx] = []
+
+            frame_index_db['frames'][fidx].append({
+                'id': obj_id,
+                'name': obj_name,
+                'bbox': frame_info.get('bbox', [0, 0, 0, 0]),
+                'position': frame_info.get('position', ''),
+                'description': obj_description
+            })
+
+    return frame_index_db
+
+
+def visualize_vlkgp_bboxes(vlkgp_results, frame_path, frame_index=None, scale=1, max_objects=None):
+    """
+    Visualize bounding boxes from vl-kgp results for a specific frame.
+    Uses OpenCV for memory efficiency.
+
+    Args:
+        vlkgp_results: Dict with 'objects' and 'image_paths' from vl-kgp pipeline.
+        frame_path: Path to the frame image (str or Path).
+        frame_index: Optional frame index. If None, will auto-detect from image_paths.
+        scale: Scale factor for display (default: 1).
+        max_objects: Max number of objects to draw (for debugging). None = all.
+
+    Returns:
+        List of detected objects for this frame.
+    """
+    import cv2
+    from IPython.display import display
+
+    frame_path = Path(frame_path)
+
+    # Build frame index
+    frame_db = build_vlkgp_frame_index(vlkgp_results)
+
+    # Auto-detect frame_index from image_paths if not provided
+    if frame_index is None:
+        image_paths = frame_db['image_paths']
+        frame_name = frame_path.name
+
+        for idx, img_path in enumerate(image_paths):
+            if Path(img_path).name == frame_name:
+                frame_index = idx
+                break
+
+        if frame_index is None:
+            print(f"Could not find {frame_name} in image_paths")
+            print(f"Available: {[Path(p).name for p in image_paths]}")
+            return []
+
+    # Load image with OpenCV
+    img_bgr = cv2.imread(str(frame_path))
+    if img_bgr is None:
+        print(f"Failed to load image: {frame_path}")
+        return []
+
+    img_height, img_width = img_bgr.shape[:2]
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # Get objects for this frame
+    frame_objects = frame_db['frames'].get(frame_index, [])
+
+    if not frame_objects:
+        print(f"No objects found for frame_index={frame_index}")
+        print(f"Available frame indices: {sorted(frame_db['frames'].keys())}")
+        return []
+
+    # Limit objects if requested
+    if max_objects is not None:
+        frame_objects = frame_objects[:max_objects]
+
+    # Generate consistent colors per object ID
+    unique_ids = list(set(obj['id'] for obj in frame_objects))
+    np.random.seed(42)
+    id_colors = {obj_id: (np.random.randint(50, 255), np.random.randint(50, 255), np.random.randint(50, 255))
+                 for obj_id in unique_ids}
+
+    # Draw bboxes
+    for obj in frame_objects:
+        bbox = obj['bbox']
+
+        # vl-kgp bbox format: [y_min, x_min, y_max, x_max] normalized 0-1000
+        y1_norm, x1_norm, y2_norm, x2_norm = bbox
+
+        # Convert to pixel coordinates
+        y1 = int(y1_norm / 1000 * img_height)
+        x1 = int(x1_norm / 1000 * img_width)
+        y2 = int(y2_norm / 1000 * img_height)
+        x2 = int(x2_norm / 1000 * img_width)
+
+        color = id_colors[obj['id']]
+
+        # Draw rectangle
+        cv2.rectangle(img_rgb, (x1, y1), (x2, y2), color, 2)
+
+        # Draw label
+        label = f"{obj['id']}: {obj['name']}"
+        (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+
+        # Background for text
+        cv2.rectangle(img_rgb, (x1, y1 - text_h - 8), (x1 + text_w + 4, y1), color, -1)
+        cv2.putText(img_rgb, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    # Resize for display
+    if scale != 1.0:
+        new_w = int(img_width * scale)
+        new_h = int(img_height * scale)
+        img_rgb = cv2.resize(img_rgb, (new_w, new_h))
+
+    # Convert to PIL and display
+    result_img = Image.fromarray(img_rgb)
+    print(f"vl-kgp Objects for Frame {frame_index} ({frame_path.name}): {len(frame_objects)} objects")
+    display(result_img)
+
+    return frame_objects
