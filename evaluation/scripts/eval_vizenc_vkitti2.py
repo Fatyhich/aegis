@@ -1,8 +1,16 @@
 """
-Evaluate VizEnc on Replica dataset with FastSAM/SAM1 segmentation + instance GT.
+Evaluate VizEnc on Virtual KITTI 2 dataset with SAM1 segmentation + trackID GT.
 
-Similar to eval_fastsam_with_instance_gt.py but using VizEnc (SAM1 + DINOv2/NaRADIO).
+Similar to eval_vkitti2_fastsam_instance_gt.py but using VizEnc (SAM1 + DINOv2/NaRADIO).
 """
+
+import sys
+from pathlib import Path
+
+# Add evaluation/ directory to path for local imports
+_eval_dir = Path(__file__).parent.parent
+if str(_eval_dir) not in sys.path:
+    sys.path.insert(0, str(_eval_dir))
 
 import sys
 import json
@@ -19,76 +27,86 @@ import matplotlib.pyplot as plt
 # Add modules to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from vizenc_inference import VizEncMatcher, load_and_resize_image
-from eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
+from core.vizenc_inference import VizEncMatcher, load_and_resize_image
+from core.eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
 
 
-def load_replica_instance_mask(instance_mask_path):
-    """Load Replica instance mask (PNG format)."""
-    mask_img = Image.open(instance_mask_path)
-    return np.array(mask_img)
-
-
-def assign_masks_to_instances(sam_masks, instance_img):
+def load_vkitti2_instance_mask(instance_mask_path):
     """
-    Assign each SAM mask to an instance ID based on maximum overlap.
+    Load Virtual KITTI 2 instance mask (PNG format).
+
+    Format: pixel_value = trackID + 1
+    Background has trackID = 0 (pixel value = 1)
+    """
+    mask_img = Image.open(instance_mask_path)
+    mask_array = np.array(mask_img)
+
+    # Convert pixel values to trackIDs
+    track_ids = mask_array.astype(np.int32) - 1
+
+    return track_ids
+
+
+def assign_sam_masks_to_trackids(sam_masks, track_img):
+    """
+    Assign each SAM mask to a trackID based on maximum overlap.
 
     Args:
         sam_masks: numpy array (M, H, W) - binary masks from SAM
-        instance_img: numpy array (H, W) - instance IDs
+        track_img: numpy array (H, W) - trackIDs
 
     Returns:
-        List of instance IDs for each mask (length M)
+        List of trackIDs for each mask (length M)
     """
-    instance_ids = []
+    track_ids = []
 
     for mask in sam_masks:
-        # Get instance IDs covered by this mask
-        covered_instances = instance_img[mask]
+        # Get trackIDs covered by this mask
+        covered_tracks = track_img[mask]
 
-        if len(covered_instances) == 0:
-            instance_ids.append(-1)  # No coverage
+        if len(covered_tracks) == 0:
+            track_ids.append(-1)  # No coverage
             continue
 
-        # Count pixels per instance
-        unique, counts = np.unique(covered_instances, return_counts=True)
+        # Count pixels per trackID
+        unique, counts = np.unique(covered_tracks, return_counts=True)
 
-        # Remove background (typically 0)
-        valid_idx = unique != 0
+        # Remove background (trackID = 0)
+        valid_idx = unique > 0
         if not valid_idx.any():
-            instance_ids.append(-1)
+            track_ids.append(-1)
             continue
 
         valid_unique = unique[valid_idx]
         valid_counts = counts[valid_idx]
 
-        # Assign to instance with maximum overlap
-        best_instance = valid_unique[np.argmax(valid_counts)]
-        instance_ids.append(int(best_instance))
+        # Assign to trackID with maximum overlap
+        best_track = valid_unique[np.argmax(valid_counts)]
+        track_ids.append(int(best_track))
 
-    return instance_ids
+    return track_ids
 
 
-def generate_instance_gt_for_sam(instance_ids0, instance_ids1):
+def generate_trackid_gt_for_sam(track_ids0, track_ids1):
     """
-    Generate ground truth matrix where gt[i,j] = 1 if same instance ID.
+    Generate ground truth matrix where gt[i,j] = 1 if same trackID.
 
     Args:
-        instance_ids0: List of instance IDs for masks in image 0
-        instance_ids1: List of instance IDs for masks in image 1
+        track_ids0: List of trackIDs for masks in image 0
+        track_ids1: List of trackIDs for masks in image 1
 
     Returns:
         numpy array (M, N) - binary ground truth matrix
     """
-    M = len(instance_ids0)
-    N = len(instance_ids1)
+    M = len(track_ids0)
+    N = len(track_ids1)
     gt_matrix = np.zeros((M, N), dtype=np.float32)
 
-    for i, id0 in enumerate(instance_ids0):
+    for i, id0 in enumerate(track_ids0):
         if id0 == -1:  # Invalid mask
             continue
 
-        for j, id1 in enumerate(instance_ids1):
+        for j, id1 in enumerate(track_ids1):
             if id1 == -1:
                 continue
 
@@ -115,9 +133,9 @@ def denormalize_image(img_tensor):
         return np.clip(img, 0, 1)
 
 
-def visualize_vizenc_results(img0, img1, masks0, masks1, instance_ids0, instance_ids1,
-                              scores, gt_matrix, save_path, pair_info):
-    """Visualize VizEnc matching results (overview)."""
+def visualize_vkitti2_results(img0, img1, masks0, masks1, track_ids0, track_ids1,
+                               scores, gt_matrix, save_path, pair_info):
+    """Visualize VizEnc matching results for VKITTI2 (overview)."""
     fig = plt.figure(figsize=(20, 10))
 
     # Original images
@@ -180,10 +198,10 @@ def visualize_vizenc_results(img0, img1, masks0, masks1, instance_ids0, instance
         plt.colorbar(im, ax=ax6, label='GT Match')
     ax6.set_xlabel('Mask Index (Image 1)')
     ax6.set_ylabel('Mask Index (Image 0)')
-    ax6.set_title('Ground Truth (Instance ID Match)')
+    ax6.set_title('Ground Truth (TrackID Match)')
 
     # Add scene info
-    scene_info = f"Scene: {pair_info['scene']} (Sequence_1)"
+    scene_info = f"Scene: {pair_info['scene']}, Variant: {pair_info['variant']}"
     if 'angle' in pair_info:
         scene_info += f", Angle: {pair_info['angle']:.1f}°"
     fig.suptitle(f"VizEnc Matching Results\n{scene_info}", fontsize=14)
@@ -196,22 +214,22 @@ def visualize_vizenc_results(img0, img1, masks0, masks1, instance_ids0, instance
 def visualize_gt_vs_predicted_pairs(
     img0, img1,
     masks0, masks1,
-    instance_ids0, instance_ids1,
+    track_ids0, track_ids1,
     scores, gt_matrix,
     save_path, num_examples=5
 ):
     """
-    Visualize GT mask pairs vs Predicted mask pairs side-by-side.
+    Visualize GT mask pairs vs Predicted mask pairs side-by-side for VKITTI2.
 
     Shows:
     - Query mask from Image 0
-    - GT match from Image 1 (based on instance IDs)
+    - GT match from Image 1 (based on trackIDs)
     - Predicted match from Image 1 (based on VizEnc scores)
 
     Args:
         img0, img1: PIL Images or numpy arrays
         masks0, masks1: numpy arrays (M, H, W) and (N, H, W)
-        instance_ids0, instance_ids1: Lists of instance IDs
+        track_ids0, track_ids1: Lists of trackIDs
         scores: numpy array (M, N) - similarity scores
         gt_matrix: numpy array (M, N) - ground truth
         save_path: Path to save visualization
@@ -241,7 +259,7 @@ def visualize_gt_vs_predicted_pairs(
                     'query_idx': i,
                     'gt_target_idx': j,
                     'pred_target_idx': pred_j,
-                    'instance_id': instance_ids0[i],
+                    'track_id': track_ids0[i],
                     'gt_score': gt_score,
                     'pred_score': pred_score,
                     'is_correct': is_correct
@@ -264,7 +282,7 @@ def visualize_gt_vs_predicted_pairs(
         query_idx = pair_info['query_idx']
         gt_idx = pair_info['gt_target_idx']
         pred_idx = pair_info['pred_target_idx']
-        instance_id = pair_info['instance_id']
+        track_id = pair_info['track_id']
         gt_score = pair_info['gt_score']
         pred_score = pair_info['pred_score']
         is_correct = pair_info['is_correct']
@@ -279,7 +297,7 @@ def visualize_gt_vs_predicted_pairs(
         mask0 = masks0[query_idx]
         colored_img0[mask0 > 0] = colored_img0[mask0 > 0] * 0.5 + np.array([1, 1, 0]) * 0.5  # Yellow
         axes[row, 1].imshow(colored_img0)
-        axes[row, 1].set_title(f'Query Mask\nInstance ID={instance_id}', fontsize=10)
+        axes[row, 1].set_title(f'Query Mask\nTrackID={track_id}', fontsize=10)
         axes[row, 1].axis('off')
 
         # Column 2: GT match from Image 1
@@ -305,7 +323,7 @@ def visualize_gt_vs_predicted_pairs(
 
         # Column 4: Comparison info
         info_text = f"Query: {query_idx}\n"
-        info_text += f"Instance ID: {instance_id}\n\n"
+        info_text += f"TrackID: {track_id}\n\n"
         info_text += f"GT Match: {gt_idx}\n"
         info_text += f"GT Score: {gt_score:.3f}\n\n"
         info_text += f"Predicted: {pred_idx}\n"
@@ -331,10 +349,9 @@ def visualize_gt_vs_predicted_pairs(
     plt.close()
 
 
-def evaluate_vizenc_replica(
+def evaluate_vizenc_vkitti2(
     pairs_file: str,
     data_root: str,
-    instance_root: str,
     output_dir: str,
     config_path: str,
     encoder_type: str = 'dinov2',
@@ -345,7 +362,7 @@ def evaluate_vizenc_replica(
     save_visualizations: bool = False,
     num_vis_samples: int = 10
 ):
-    """Run VizEnc evaluation on Replica dataset."""
+    """Run VizEnc evaluation on Virtual KITTI 2 dataset."""
 
     # Load config
     with open(config_path, 'r') as f:
@@ -358,7 +375,7 @@ def evaluate_vizenc_replica(
     if num_pairs is not None:
         pairs = pairs[:num_pairs]
 
-    print(f"Evaluating {len(pairs)} pairs on Replica")
+    print(f"Evaluating {len(pairs)} pairs on Virtual KITTI 2")
     print(f"Method: VizEnc (SAM1 + {encoder_type.upper()})")
 
     # Create output directory
@@ -391,26 +408,27 @@ def evaluate_vizenc_replica(
 
     vis_counter = 0
     data_root = Path(data_root)
-    instance_root = Path(instance_root)
 
     for pair_idx, pair in enumerate(tqdm(pairs, desc="Evaluating pairs")):
         scene = pair['scene']
+        variant = pair['variant']
         idx0 = pair['idx0']
         idx1 = pair['idx1']
         pose_bin = pair['pose_bin']
 
-        # Get paths (Sequence_1 is hardcoded, not in pairs)
-        rgb0_path = data_root / scene / "Sequence_1" / "rgb" / f"rgb_{idx0}.png"
-        rgb1_path = data_root / scene / "Sequence_1" / "rgb" / f"rgb_{idx1}.png"
-        inst0_path = instance_root / scene / "Sequence_1" / "semantic_instance" / f"semantic_instance_{idx0}.png"
-        inst1_path = instance_root / scene / "Sequence_1" / "semantic_instance" / f"semantic_instance_{idx1}.png"
+        # Get paths
+        rgb0_path = data_root / "vkitti_rgb" / scene / variant / "frames" / "rgb" / "Camera_0" / f"rgb_{idx0:05d}.jpg"
+        rgb1_path = data_root / "vkitti_rgb" / scene / variant / "frames" / "rgb" / "Camera_0" / f"rgb_{idx1:05d}.jpg"
+
+        inst0_path = data_root / "vkitti_instanceSegmentation" / scene / variant / "frames" / "instanceSegmentation" / "Camera_0" / f"instancegt_{idx0:05d}.png"
+        inst1_path = data_root / "vkitti_instanceSegmentation" / scene / variant / "frames" / "instanceSegmentation" / "Camera_0" / f"instancegt_{idx1:05d}.png"
 
         if not rgb0_path.exists() or not rgb1_path.exists():
-            print(f"\nWarning: RGB images not found for {scene} frames {idx0}-{idx1}")
+            print(f"\nWarning: RGB images not found for {scene}/{variant} frames {idx0}-{idx1}")
             continue
 
         if not inst0_path.exists() or not inst1_path.exists():
-            print(f"\nWarning: Instance masks not found for {scene} frames {idx0}-{idx1}")
+            print(f"\nWarning: Instance masks not found for {scene}/{variant} frames {idx0}-{idx1}")
             continue
 
         # Load and resize images
@@ -429,20 +447,20 @@ def evaluate_vizenc_replica(
         if len(masks0) == 0 or len(masks1) == 0:
             continue
 
-        # Load instance masks
-        inst_img0 = load_replica_instance_mask(str(inst0_path))
-        inst_img1 = load_replica_instance_mask(str(inst1_path))
+        # Load trackID masks
+        track_img0 = load_vkitti2_instance_mask(str(inst0_path))
+        track_img1 = load_vkitti2_instance_mask(str(inst1_path))
 
-        # Resize instance masks to match target size
-        inst_img0_resized = np.array(Image.fromarray(inst_img0).resize((target_w, target_h), Image.NEAREST))
-        inst_img1_resized = np.array(Image.fromarray(inst_img1).resize((target_w, target_h), Image.NEAREST))
+        # Resize to match target size
+        track_img0_resized = np.array(Image.fromarray(track_img0).resize((target_w, target_h), Image.NEAREST))
+        track_img1_resized = np.array(Image.fromarray(track_img1).resize((target_w, target_h), Image.NEAREST))
 
-        # Assign SAM masks to instance IDs
-        instance_ids0 = assign_masks_to_instances(masks0, inst_img0_resized)
-        instance_ids1 = assign_masks_to_instances(masks1, inst_img1_resized)
+        # Assign SAM masks to trackIDs
+        track_ids0 = assign_sam_masks_to_trackids(masks0, track_img0_resized)
+        track_ids1 = assign_sam_masks_to_trackids(masks1, track_img1_resized)
 
         # Generate ground truth
-        gt_matrix = generate_instance_gt_for_sam(instance_ids0, instance_ids1)
+        gt_matrix = generate_trackid_gt_for_sam(track_ids0, track_ids1)
 
         # Skip if no valid matches
         if gt_matrix.sum() == 0:
@@ -459,6 +477,7 @@ def evaluate_vizenc_replica(
             if save_visualizations and vis_counter < num_vis_samples:
                 pair_info = {
                     'scene': scene,
+                    'variant': variant,
                     'idx0': idx0,
                     'idx1': idx1,
                     'angle': pair.get('angle', 0)
@@ -466,10 +485,10 @@ def evaluate_vizenc_replica(
 
                 # Overview visualization
                 vis_path = vis_dir / f"pair_{pair_idx:04d}_vizenc.png"
-                visualize_vizenc_results(
+                visualize_vkitti2_results(
                     img0, img1,
                     masks0, masks1,
-                    instance_ids0, instance_ids1,
+                    track_ids0, track_ids1,
                     scores, gt_matrix, vis_path, pair_info
                 )
 
@@ -478,7 +497,7 @@ def evaluate_vizenc_replica(
                 visualize_gt_vs_predicted_pairs(
                     img0, img1,
                     masks0, masks1,
-                    instance_ids0, instance_ids1,
+                    track_ids0, track_ids1,
                     scores, gt_matrix, vis_path2, num_examples=5
                 )
 
@@ -508,17 +527,15 @@ def evaluate_vizenc_replica(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate VizEnc on Replica dataset")
-    parser.add_argument("--pairs", type=str, default="pairs_replica_3200.json")
-    parser.add_argument("--data_root", type=str, default="/mnt/vol3/datasets/semantic-replica")
-    parser.add_argument("--instance_root", type=str,
-                        default="/mnt/vol3/datasets/semantic-replica/Replica_Instance_Segmentation")
-    parser.add_argument("--config", type=str, default="configs/config_eval_replica.yaml")
+    parser = argparse.ArgumentParser(description="Evaluate VizEnc on Virtual KITTI 2")
+    parser.add_argument("--pairs", type=str, default="pairs_vkitti2.json")
+    parser.add_argument("--data_root", type=str, default="/mnt/vol3/datasets/virtual-KITTI-2")
+    parser.add_argument("--config", type=str, default="configs/config_eval_vkitti2.yaml")
     parser.add_argument("--encoder", type=str, default="dinov2", choices=["dinov2", "naradio"])
     parser.add_argument("--encoder_model", type=str, default=None,
                         help="Model name (e.g., facebook/dinov2-base or radio_v2.5-b)")
     parser.add_argument("--sam_checkpoint", type=str, default=None)
-    parser.add_argument("--output_dir", type=str, default="results/vizenc_replica")
+    parser.add_argument("--output_dir", type=str, default="results/vizenc_vkitti2")
     parser.add_argument("--num_pairs", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--visualize", action="store_true")
@@ -526,10 +543,9 @@ def main():
 
     args = parser.parse_args()
 
-    evaluate_vizenc_replica(
+    evaluate_vizenc_vkitti2(
         pairs_file=args.pairs,
         data_root=args.data_root,
-        instance_root=args.instance_root,
         output_dir=args.output_dir,
         config_path=args.config,
         encoder_type=args.encoder,

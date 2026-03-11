@@ -1,12 +1,20 @@
 """
-CORRECT Evaluation: FastSAM segmentation + Instance ID ground truth
+Evaluation on Virtual KITTI 2: FastSAM segmentation + Instance ID ground truth
 
-This is the RIGHT way to evaluate SegMASt3R:
+Pipeline:
 1. Use FastSAM to generate masks (realistic input)
-2. Use Replica instance IDs to define ground truth (proper evaluation)
-3. Assign each FastSAM mask to an instance ID based on maximum overlap
-4. Two FastSAM masks match if they have the same instance ID
+2. Use Virtual KITTI 2 instance IDs (trackIDs) to define ground truth
+3. Assign each FastSAM mask to a trackID based on maximum overlap
+4. Two FastSAM masks match if they have the same trackID
 """
+
+import sys
+from pathlib import Path
+
+# Add evaluation/ directory to path for local imports
+_eval_dir = Path(__file__).parent.parent
+if str(_eval_dir) not in sys.path:
+    sys.path.insert(0, str(_eval_dir))
 
 import argparse
 import torch
@@ -17,101 +25,122 @@ import json
 import yaml
 from collections import defaultdict
 
-from segmentor import SegmentationPipeline
-from model_infer import MASt3RSegFeatInfer
-from eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
-from ground_truth_generator import load_instance_mask, instance_img_to_binary_masks
+from core.segmentor import SegmentationPipeline
+from core.model_infer import MASt3RSegFeatInfer
+from core.eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
 from eval_with_fastsam import run_fastsam_on_image, denormalize_image
 from PIL import Image
 import matplotlib.pyplot as plt
 
 
-def assign_masks_to_instances(fastsam_masks, instance_img):
+def load_vkitti2_instance_mask(mask_path: str) -> np.ndarray:
     """
-    Assign each FastSAM mask to an instance ID based on maximum overlap.
+    Load instance mask from Virtual KITTI 2.
+
+    Args:
+        mask_path: Path to instancegt PNG file
+
+    Returns:
+        Instance mask (H, W) with trackIDs (0 = background)
+    """
+    img = Image.open(mask_path)
+    mask = np.array(img, dtype=np.uint8)
+
+    # In VKITTI2: pixel_value = trackID + 1
+    # Convert to trackIDs: trackID = pixel_value - 1
+    # Keep 0 as background
+    track_ids = mask.copy()
+    track_ids[track_ids > 0] = track_ids[track_ids > 0] - 1
+
+    return track_ids
+
+
+def assign_fastsam_masks_to_trackids(fastsam_masks, track_img):
+    """
+    Assign each FastSAM mask to a trackID based on maximum overlap.
 
     Args:
         fastsam_masks: (M, H, W) FastSAM binary masks
-        instance_img: (H, W) instance segmentation image with instance IDs
+        track_img: (H, W) trackID image (0 = background)
 
     Returns:
-        instance_ids: List of M instance IDs (one per FastSAM mask)
-                     -1 if mask doesn't overlap with any instance
+        track_ids: List of M trackIDs (one per FastSAM mask)
+                   -1 if mask doesn't overlap with any tracked object
     """
     M = fastsam_masks.shape[0]
-    instance_ids = []
+    track_ids = []
 
     for i in range(M):
         mask = fastsam_masks[i].numpy() if torch.is_tensor(fastsam_masks[i]) else fastsam_masks[i]
 
-        # Get instance IDs that overlap with this mask
-        overlapping_pixels = instance_img[mask > 0]
+        # Get trackIDs that overlap with this mask
+        overlapping_pixels = track_img[mask > 0]
 
         if len(overlapping_pixels) == 0:
             # No overlap
-            instance_ids.append(-1)
+            track_ids.append(-1)
             continue
 
-        # Find most common instance ID (excluding background 0)
+        # Find most common trackID (excluding background 0)
         unique_ids, counts = np.unique(overlapping_pixels, return_counts=True)
 
         # Filter out background
         valid_mask = unique_ids > 0
         if not valid_mask.any():
-            instance_ids.append(-1)
+            track_ids.append(-1)
             continue
 
         unique_ids = unique_ids[valid_mask]
         counts = counts[valid_mask]
 
-        # Get ID with maximum overlap
+        # Get trackID with maximum overlap
         best_id = unique_ids[np.argmax(counts)]
-        instance_ids.append(int(best_id))
+        track_ids.append(int(best_id))
 
-    return instance_ids
+    return track_ids
 
 
-def generate_instance_gt_for_fastsam(instance_ids0, instance_ids1):
+def generate_trackid_gt_for_fastsam(track_ids0, track_ids1):
     """
-    Generate ground truth based on instance IDs assigned to FastSAM masks.
+    Generate ground truth based on trackIDs assigned to FastSAM masks.
 
     Args:
-        instance_ids0: List of M instance IDs for masks0
-        instance_ids1: List of N instance IDs for masks1
+        track_ids0: List of M trackIDs for masks0
+        track_ids1: List of N trackIDs for masks1
 
     Returns:
         Binary ground truth matrix (M, N)
     """
-    M = len(instance_ids0)
-    N = len(instance_ids1)
+    M = len(track_ids0)
+    N = len(track_ids1)
 
     gt = np.zeros((M, N), dtype=np.uint8)
 
     for i in range(M):
         for j in range(N):
-            id0 = instance_ids0[i]
-            id1 = instance_ids1[j]
+            id0 = track_ids0[i]
+            id1 = track_ids1[j]
 
-            # Match if same instance ID and both are valid (> 0)
+            # Match if same trackID and both are valid (> 0)
             if id0 > 0 and id1 > 0 and id0 == id1:
                 gt[i, j] = 1
 
     return gt
 
 
-def visualize_fastsam_with_instance_gt(
+def visualize_vkitti2_results(
     img0_tensor,
     img1_tensor,
     fastsam_masks0,
     fastsam_masks1,
-    instance_ids0,
-    instance_ids1,
+    track_ids0,
+    track_ids1,
     scores,
     gt_matrix,
     save_path,
     pair_info=None
 ):
-    """Visualize FastSAM + Instance GT matching."""
+    """Visualize Virtual KITTI 2 matching results."""
     img0_np = denormalize_image(img0_tensor)
     img1_np = denormalize_image(img1_tensor)
 
@@ -122,9 +151,9 @@ def visualize_fastsam_with_instance_gt(
     fig = plt.figure(figsize=(20, 10))
 
     if pair_info:
-        title = f"Scene: {pair_info.get('scene', 'unknown')}, " \
-                f"Frames: {pair_info.get('idx0', '?')}->{pair_info.get('idx1', '?')}, " \
-                f"Angle: {pair_info.get('angle', 0):.1f}°"
+        title = f"Scene: {pair_info.get('scene', 'unknown')}, Variant: {pair_info.get('variant', 'unknown')}\n"
+        title += f"Frames: {pair_info.get('idx0', '?')}->{pair_info.get('idx1', '?')}, "
+        title += f"Angle: {pair_info.get('angle', 0):.1f}°"
         fig.suptitle(title, fontsize=14, fontweight='bold')
 
     # Row 1: Images and FastSAM masks
@@ -161,7 +190,7 @@ def visualize_fastsam_with_instance_gt(
     im1 = ax5.imshow(gt_matrix, aspect='auto', cmap='RdYlGn', vmin=0, vmax=1)
     ax5.set_xlabel('Target segments (Img 1)', fontsize=9)
     ax5.set_ylabel('Query segments (Img 0)', fontsize=9)
-    ax5.set_title(f'GT (Instance IDs)\n{int(gt_matrix.sum())} matches', fontsize=11)
+    ax5.set_title(f'GT (TrackIDs)\n{int(gt_matrix.sum())} matches', fontsize=11)
     plt.colorbar(im1, ax=ax5, fraction=0.046)
 
     ax6 = plt.subplot(2, 4, 6)
@@ -171,15 +200,15 @@ def visualize_fastsam_with_instance_gt(
     ax6.set_title('Predicted Scores', fontsize=11)
     plt.colorbar(im2, ax=ax6, fraction=0.046)
 
-    # Instance ID info
+    # TrackID info
     ax7 = plt.subplot(2, 4, 7)
-    info_text = "FastSAM → Instance IDs:\n\n"
+    info_text = "FastSAM → TrackIDs:\n\n"
     info_text += "Image 0 (first 10):\n"
     for i in range(min(10, M)):
-        info_text += f"  Mask {i}: ID={instance_ids0[i]}\n"
+        info_text += f"  Mask {i}: trackID={track_ids0[i]}\n"
     info_text += f"\nImage 1 (first 10):\n"
     for i in range(min(10, N)):
-        info_text += f"  Mask {i}: ID={instance_ids1[i]}\n"
+        info_text += f"  Mask {i}: trackID={track_ids1[i]}\n"
 
     ax7.text(0.05, 0.95, info_text, fontsize=8,
              verticalalignment='top', fontfamily='monospace',
@@ -190,7 +219,7 @@ def visualize_fastsam_with_instance_gt(
 
     # Metrics
     ax8 = plt.subplot(2, 4, 8)
-    from eval_metrics import compute_metrics
+    from core.eval_metrics import compute_metrics
     metrics = compute_metrics(scores, gt_matrix)
 
     metrics_text = "Metrics:\n\n"
@@ -200,10 +229,10 @@ def visualize_fastsam_with_instance_gt(
     metrics_text += f"\nQueries: {metrics['num_queries']}\n"
     metrics_text += f"GT matches: {int(gt_matrix.sum())}\n\n"
 
-    # Count shared instance IDs
-    shared_ids = set([id for id in instance_ids0 if id > 0]) & \
-                 set([id for id in instance_ids1 if id > 0])
-    metrics_text += f"Shared instances: {len(shared_ids)}"
+    # Count shared trackIDs
+    shared_ids = set([id for id in track_ids0 if id > 0]) & \
+                 set([id for id in track_ids1 if id > 0])
+    metrics_text += f"Shared vehicles: {len(shared_ids)}"
 
     ax8.text(0.1, 0.5, metrics_text, fontsize=11,
              verticalalignment='center', fontfamily='monospace',
@@ -222,20 +251,15 @@ def visualize_gt_vs_predicted_pairs(
     img1_tensor,
     fastsam_masks0,
     fastsam_masks1,
-    instance_ids0,
-    instance_ids1,
+    track_ids0,
+    track_ids1,
     scores,
     gt_matrix,
     save_path,
     num_examples=5
 ):
     """
-    Visualize GT mask pairs vs Predicted mask pairs side-by-side.
-
-    Shows:
-    - Query mask from Image 0
-    - GT match from Image 1 (based on instance IDs)
-    - Predicted match from Image 1 (based on SegMASt3R scores)
+    Visualize GT vs Predicted mask pairs side-by-side for VKITTI2.
     """
     img0_np = denormalize_image(img0_tensor)
     img1_np = denormalize_image(img1_tensor)
@@ -248,33 +272,27 @@ def visualize_gt_vs_predicted_pairs(
     for i in range(M):
         for j in range(N):
             if gt_matrix[i, j] == 1:
-                # Get predicted match for query i
                 pred_j = np.argmax(scores[i])
                 pred_score = scores[i, pred_j]
                 is_correct = (pred_j == j)
-
-                # Get score for GT match
                 gt_score = scores[i, j]
 
                 gt_pairs.append({
                     'query_idx': i,
                     'gt_target_idx': j,
                     'pred_target_idx': pred_j,
-                    'instance_id': instance_ids0[i],
+                    'track_id': track_ids0[i],
                     'gt_score': gt_score,
                     'pred_score': pred_score,
                     'is_correct': is_correct
                 })
 
     if len(gt_pairs) == 0:
-        print("No GT pairs to visualize")
         return
 
-    # Sort by GT score (show best GT matches first)
     gt_pairs.sort(key=lambda x: x['gt_score'], reverse=True)
     num_to_show = min(num_examples, len(gt_pairs))
 
-    # Create figure: Query, GT Match, Predicted Match (3 columns per row)
     fig, axes = plt.subplots(num_to_show, 5, figsize=(20, 4*num_to_show))
     if num_to_show == 1:
         axes = axes.reshape(1, -1)
@@ -283,7 +301,7 @@ def visualize_gt_vs_predicted_pairs(
         query_idx = pair_info['query_idx']
         gt_idx = pair_info['gt_target_idx']
         pred_idx = pair_info['pred_target_idx']
-        instance_id = pair_info['instance_id']
+        track_id = pair_info['track_id']
         gt_score = pair_info['gt_score']
         pred_score = pair_info['pred_score']
         is_correct = pair_info['is_correct']
@@ -293,26 +311,26 @@ def visualize_gt_vs_predicted_pairs(
         axes[row, 0].set_title(f'Image 0\nQuery {query_idx}', fontsize=10)
         axes[row, 0].axis('off')
 
-        # Column 1: Query mask highlighted
+        # Column 1: Query mask
         colored_img0 = img0_np.copy()
         mask0 = fastsam_masks0[query_idx]
-        colored_img0[mask0 > 0] = colored_img0[mask0 > 0] * 0.5 + np.array([1, 1, 0]) * 0.5  # Yellow
+        colored_img0[mask0 > 0] = colored_img0[mask0 > 0] * 0.5 + np.array([1, 1, 0]) * 0.5
         axes[row, 1].imshow(colored_img0)
-        axes[row, 1].set_title(f'Query Mask\nInstance ID={instance_id}', fontsize=10)
+        axes[row, 1].set_title(f'Query Mask\nTrackID={track_id}', fontsize=10)
         axes[row, 1].axis('off')
 
-        # Column 2: GT match from Image 1
+        # Column 2: GT match
         colored_img1_gt = img1_np.copy()
         mask1_gt = fastsam_masks1[gt_idx]
-        colored_img1_gt[mask1_gt > 0] = colored_img1_gt[mask1_gt > 0] * 0.5 + np.array([0, 1, 0]) * 0.5  # Green
+        colored_img1_gt[mask1_gt > 0] = colored_img1_gt[mask1_gt > 0] * 0.5 + np.array([0, 1, 0]) * 0.5
         axes[row, 2].imshow(colored_img1_gt)
         axes[row, 2].set_title(f'GT MATCH\nTarget {gt_idx}\nScore: {gt_score:.3f}', fontsize=10, color='green')
         axes[row, 2].axis('off')
 
-        # Column 3: Predicted match from Image 1
+        # Column 3: Predicted match
         colored_img1_pred = img1_np.copy()
         mask1_pred = fastsam_masks1[pred_idx]
-        pred_color = [0, 1, 0] if is_correct else [1, 0, 0]  # Green if correct, red if wrong
+        pred_color = [0, 1, 0] if is_correct else [1, 0, 0]
         colored_img1_pred[mask1_pred > 0] = colored_img1_pred[mask1_pred > 0] * 0.5 + np.array(pred_color) * 0.5
 
         status = "✓ CORRECT" if is_correct else "✗ WRONG"
@@ -322,9 +340,9 @@ def visualize_gt_vs_predicted_pairs(
                               fontsize=10, color=title_color)
         axes[row, 3].axis('off')
 
-        # Column 4: Comparison info
+        # Column 4: Info
         info_text = f"Query: {query_idx}\n"
-        info_text += f"Instance ID: {instance_id}\n\n"
+        info_text += f"TrackID: {track_id}\n\n"
         info_text += f"GT Match: {gt_idx}\n"
         info_text += f"GT Score: {gt_score:.3f}\n\n"
         info_text += f"Predicted: {pred_idx}\n"
@@ -350,10 +368,9 @@ def visualize_gt_vs_predicted_pairs(
     plt.close()
 
 
-def evaluate_fastsam_with_instance_gt(
+def evaluate_vkitti2_fastsam_instance_gt(
     pairs_file,
     data_root,
-    instance_mask_root,
     checkpoint_path,
     output_dir,
     config_path,
@@ -363,7 +380,7 @@ def evaluate_fastsam_with_instance_gt(
     num_vis_samples=10
 ):
     """
-    Evaluate SegMASt3R using FastSAM masks + Instance ID ground truth.
+    Evaluate SegMASt3R on Virtual KITTI 2 using FastSAM masks + TrackID ground truth.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -377,8 +394,6 @@ def evaluate_fastsam_with_instance_gt(
         cfg = yaml.safe_load(f)
 
     cfg['MODEL']['CHECKPOINT'] = checkpoint_path
-    cfg['DATASET']['DATA_ROOT'] = data_root
-    cfg['DATASET']['INSTANCE_MASK_ROOT'] = instance_mask_root
 
     # Load pairs
     with open(pairs_file, 'r') as f:
@@ -387,8 +402,8 @@ def evaluate_fastsam_with_instance_gt(
     if num_pairs is not None:
         pairs = pairs[:num_pairs]
 
-    print(f"Evaluating {len(pairs)} pairs")
-    print("Method: FastSAM segmentation + Instance ID ground truth")
+    print(f"Evaluating {len(pairs)} pairs on Virtual KITTI 2")
+    print("Method: FastSAM segmentation + TrackID ground truth")
 
     # Initialize FastSAM
     print("\nInitializing FastSAM...")
@@ -422,27 +437,34 @@ def evaluate_fastsam_with_instance_gt(
     target_w = cfg['DATASET']['RESIZE_W']
 
     vis_counter = 0
+    data_root = Path(data_root)
 
     for pair_idx, pair in enumerate(tqdm(pairs, desc="Evaluating pairs")):
         scene = pair['scene']
+        variant = pair['variant']
         idx0 = pair['idx0']
         idx1 = pair['idx1']
         pose_bin = pair['pose_bin']
 
         # Get paths
-        data_root_path = Path(data_root)
-        instance_root_path = Path(instance_mask_root)
+        rgb0_path = data_root / "vkitti_rgb" / scene / variant / "frames" / "rgb" / "Camera_0" / f"rgb_{idx0:05d}.jpg"
+        rgb1_path = data_root / "vkitti_rgb" / scene / variant / "frames" / "rgb" / "Camera_0" / f"rgb_{idx1:05d}.jpg"
 
-        img0_path = data_root_path / scene / "Sequence_1" / "rgb" / f"rgb_{idx0}.png"
-        img1_path = data_root_path / scene / "Sequence_1" / "rgb" / f"rgb_{idx1}.png"
+        inst0_path = data_root / "vkitti_instanceSegmentation" / scene / variant / "frames" / "instanceSegmentation" / "Camera_0" / f"instancegt_{idx0:05d}.png"
+        inst1_path = data_root / "vkitti_instanceSegmentation" / scene / variant / "frames" / "instanceSegmentation" / "Camera_0" / f"instancegt_{idx1:05d}.png"
 
-        inst0_path = instance_root_path / scene / "Sequence_1" / "semantic_instance" / f"semantic_instance_{idx0}.png"
-        inst1_path = instance_root_path / scene / "Sequence_1" / "semantic_instance" / f"semantic_instance_{idx1}.png"
+        if not rgb0_path.exists() or not rgb1_path.exists():
+            print(f"\nWarning: RGB images not found for {scene}/{variant} frames {idx0}-{idx1}")
+            continue
+
+        if not inst0_path.exists() or not inst1_path.exists():
+            print(f"\nWarning: Instance masks not found for {scene}/{variant} frames {idx0}-{idx1}")
+            continue
 
         # Run FastSAM
         try:
-            fastsam_masks0, img0 = run_fastsam_on_image(segmentor, img0_path, target_h, target_w)
-            fastsam_masks1, img1 = run_fastsam_on_image(segmentor, img1_path, target_h, target_w)
+            fastsam_masks0, img0 = run_fastsam_on_image(segmentor, rgb0_path, target_h, target_w)
+            fastsam_masks1, img1 = run_fastsam_on_image(segmentor, rgb1_path, target_h, target_w)
         except Exception as e:
             print(f"\nError with FastSAM on pair {idx0}-{idx1}: {e}")
             continue
@@ -450,20 +472,20 @@ def evaluate_fastsam_with_instance_gt(
         if fastsam_masks0.shape[0] == 0 or fastsam_masks1.shape[0] == 0:
             continue
 
-        # Load instance masks
-        inst_img0 = load_instance_mask(str(inst0_path))
-        inst_img1 = load_instance_mask(str(inst1_path))
+        # Load trackID masks
+        track_img0 = load_vkitti2_instance_mask(str(inst0_path))
+        track_img1 = load_vkitti2_instance_mask(str(inst1_path))
 
         # Resize to match target size
-        inst_img0_resized = np.array(Image.fromarray(inst_img0).resize((target_w, target_h), Image.NEAREST))
-        inst_img1_resized = np.array(Image.fromarray(inst_img1).resize((target_w, target_h), Image.NEAREST))
+        track_img0_resized = np.array(Image.fromarray(track_img0).resize((target_w, target_h), Image.NEAREST))
+        track_img1_resized = np.array(Image.fromarray(track_img1).resize((target_w, target_h), Image.NEAREST))
 
-        # Assign FastSAM masks to instance IDs
-        instance_ids0 = assign_masks_to_instances(fastsam_masks0, inst_img0_resized)
-        instance_ids1 = assign_masks_to_instances(fastsam_masks1, inst_img1_resized)
+        # Assign FastSAM masks to trackIDs
+        track_ids0 = assign_fastsam_masks_to_trackids(fastsam_masks0, track_img0_resized)
+        track_ids1 = assign_fastsam_masks_to_trackids(fastsam_masks1, track_img1_resized)
 
         # Generate ground truth
-        gt_matrix = generate_instance_gt_for_fastsam(instance_ids0, instance_ids1)
+        gt_matrix = generate_trackid_gt_for_fastsam(track_ids0, track_ids1)
 
         # Skip if no valid matches
         if gt_matrix.sum() == 0:
@@ -491,26 +513,26 @@ def evaluate_fastsam_with_instance_gt(
             if save_visualizations and vis_counter < num_vis_samples:
                 pair_info = {
                     'scene': scene,
+                    'variant': variant,
                     'idx0': idx0,
                     'idx1': idx1,
                     'angle': pair.get('angle', 0)
                 }
 
-                # Overview visualization
-                vis_path = vis_dir / f"pair_{pair_idx:04d}_overview.png"
-                visualize_fastsam_with_instance_gt(
+                vis_path = vis_dir / f"pair_{pair_idx:04d}_vkitti2.png"
+                visualize_vkitti2_results(
                     img0, img1,
                     fastsam_masks0.numpy(), fastsam_masks1.numpy(),
-                    instance_ids0, instance_ids1,
+                    track_ids0, track_ids1,
                     scores_np, gt_matrix, vis_path, pair_info
                 )
 
-                # GT vs Predicted pairs visualization
+                # GT vs Predicted visualization
                 vis_path2 = vis_dir / f"pair_{pair_idx:04d}_gt_vs_pred.png"
                 visualize_gt_vs_predicted_pairs(
                     img0, img1,
                     fastsam_masks0.numpy(), fastsam_masks1.numpy(),
-                    instance_ids0, instance_ids1,
+                    track_ids0, track_ids1,
                     scores_np, gt_matrix, vis_path2, num_examples=5
                 )
 
@@ -528,26 +550,24 @@ def evaluate_fastsam_with_instance_gt(
     print(table_str)
 
     # Save results
-    results_json_path = output_dir / "metrics_fastsam_instance_gt.json"
+    results_json_path = output_dir / "metrics_vkitti2_fastsam_trackid_gt.json"
     with open(results_json_path, 'w') as f:
         json.dump(aggregated_metrics, f, indent=2)
     print(f"\nSaved metrics to: {results_json_path}")
 
-    table_txt_path = output_dir / "table2_fastsam_instance_gt.txt"
+    table_txt_path = output_dir / "table2_vkitti2_results.txt"
     with open(table_txt_path, 'w') as f:
         f.write(table_str)
     print(f"Saved table to: {table_txt_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate SegMASt3R with FastSAM + Instance GT")
-    parser.add_argument("--pairs", type=str, default="pairs_replica_3200.json")
-    parser.add_argument("--data_root", type=str, default="/mnt/vol3/datasets/semantic-replica")
-    parser.add_argument("--instance_mask_root", type=str,
-                       default="/mnt/vol3/datasets/semantic-replica/Replica_Instance_Segmentation")
+    parser = argparse.ArgumentParser(description="Evaluate SegMASt3R on Virtual KITTI 2")
+    parser.add_argument("--pairs", type=str, default="pairs_vkitti2.json")
+    parser.add_argument("--data_root", type=str, default="/mnt/vol3/datasets/virtual-KITTI-2")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/segmast3r_spp.ckpt")
-    parser.add_argument("--config", type=str, default="configs/config_eval_replica.yaml")
-    parser.add_argument("--output_dir", type=str, default="results/replica_fastsam_instance_gt")
+    parser.add_argument("--config", type=str, default="configs/config_eval_vkitti2.yaml")
+    parser.add_argument("--output_dir", type=str, default="results/vkitti2_fastsam_trackid_gt")
     parser.add_argument("--num_pairs", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--visualize", action="store_true")
@@ -555,10 +575,9 @@ def main():
 
     args = parser.parse_args()
 
-    evaluate_fastsam_with_instance_gt(
+    evaluate_vkitti2_fastsam_instance_gt(
         pairs_file=args.pairs,
         data_root=args.data_root,
-        instance_mask_root=args.instance_mask_root,
         checkpoint_path=args.checkpoint,
         output_dir=args.output_dir,
         config_path=args.config,

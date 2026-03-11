@@ -7,6 +7,14 @@ Instead of using ground truth instance masks, we:
 3. Evaluate segment matching performance
 """
 
+import sys
+from pathlib import Path
+
+# Add evaluation/ directory to path for local imports
+_eval_dir = Path(__file__).parent.parent
+if str(_eval_dir) not in sys.path:
+    sys.path.insert(0, str(_eval_dir))
+
 import argparse
 import torch
 import numpy as np
@@ -16,9 +24,9 @@ import json
 import yaml
 from collections import defaultdict
 
-from segmentor import SegmentationPipeline
-from model_infer import MASt3RSegFeatInfer
-from eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
+from core.segmentor import SegmentationPipeline
+from core.model_infer import MASt3RSegFeatInfer
+from core.eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
 from PIL import Image
 import torchvision.transforms as T
 import matplotlib.pyplot as plt
@@ -143,7 +151,7 @@ def visualize_fastsam_results(
     # Row 2: Metrics
     ax8 = plt.subplot(2, 4, 8)
     # Compute quick metrics
-    from eval_metrics import compute_metrics
+    from core.eval_metrics import compute_metrics
     metrics = compute_metrics(scores, gt_matrix)
 
     metrics_text = "Metrics:\n\n"

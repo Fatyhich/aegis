@@ -10,14 +10,10 @@ import torch
 import numpy as np
 from PIL import Image
 
-# Add src to path
-src_dir = Path(__file__).parent.parent / "src"
-if str(src_dir) not in sys.path:
-    sys.path.insert(0, str(src_dir))
 
-from segmentation.sam import init_sam
-from encoders.dinov2 import load_dinov2_model, get_dinov2_embeddings_batch
-from encoders.naradio import load_naradio_encoder, get_naradio_embeddings_batch
+from aegis.segmentation.sam import init_sam
+from aegis.encoders.dinov2 import load_dinov2_model, get_dinov2_embeddings_batch
+from aegis.encoders.naradio import load_naradio_encoder, get_naradio_embeddings_batch
 
 
 class VizEncMatcher:

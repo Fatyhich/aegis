@@ -10,6 +10,14 @@ Orchestrates the full evaluation pipeline:
 6. Save detailed results to JSON
 """
 
+import sys
+from pathlib import Path
+
+# Add evaluation/ directory to path for local imports
+_eval_dir = Path(__file__).parent.parent
+if str(_eval_dir) not in sys.path:
+    sys.path.insert(0, str(_eval_dir))
+
 import argparse
 import json
 import yaml
@@ -20,10 +28,10 @@ from tqdm import tqdm
 from collections import defaultdict
 import numpy as np
 
-from replica_dataset import ReplicaSegmentMatchDataset, collate_fn, load_pairs_from_json
-from model_infer import MASt3RSegFeatInfer
-from ground_truth_generator import generate_instance_correspondences
-from eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
+from datasets.replica_dataset import ReplicaSegmentMatchDataset, collate_fn, load_pairs_from_json
+from core.model_infer import MASt3RSegFeatInfer
+from core.ground_truth_generator import generate_instance_correspondences
+from core.eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
 
 
 def load_config(config_path: str) -> dict:

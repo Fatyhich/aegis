@@ -4,6 +4,14 @@ Quick test script for SegMASt3R on a single Replica scene with visualization.
 Samples a few image pairs from one scene, runs inference, and saves visualizations.
 """
 
+import sys
+from pathlib import Path
+
+# Add evaluation/ directory to path for local imports
+_eval_dir = Path(__file__).parent.parent
+if str(_eval_dir) not in sys.path:
+    sys.path.insert(0, str(_eval_dir))
+
 import argparse
 import torch
 import numpy as np
@@ -12,10 +20,10 @@ from pathlib import Path
 from tqdm import tqdm
 import yaml
 
-from replica_dataset import ReplicaSegmentMatchDataset
-from model_infer import MASt3RSegFeatInfer
-from ground_truth_generator import generate_instance_correspondences
-from eval_metrics import compute_metrics
+from datasets.replica_dataset import ReplicaSegmentMatchDataset
+from core.model_infer import MASt3RSegFeatInfer
+from core.ground_truth_generator import generate_instance_correspondences
+from core.eval_metrics import compute_metrics
 
 
 def visualize_matches(
@@ -235,7 +243,7 @@ def test_scene(
 
     # Sample some pairs from the scene
     print(f"\nSampling {num_pairs} pairs from {scene_name}...")
-    from sample_pairs import sample_pairs_for_scene
+    from sampling.sample_pairs import sample_pairs_for_scene
 
     scene_path = Path(cfg['DATASET']['DATA_ROOT']) / scene_name
     pose_bins = [(0, 45), (45, 90), (90, 135), (135, 180)]
