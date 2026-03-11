@@ -15,12 +15,8 @@ import argparse
 import sys
 from pathlib import Path
 
-# Add src to path
-src_dir = Path(__file__).parent.parent / "src"
-if str(src_dir) not in sys.path:
-    sys.path.insert(0, str(src_dir))
 
-from vizenc_baseline.graph.exporters import PickleExporter, JSONExporter
+from aegis.graph.exporters import PickleExporter, JSONExporter
 
 
 def print_graph_info(graph):

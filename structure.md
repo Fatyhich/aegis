@@ -1,90 +1,50 @@
 # Project Structure
 
-## vizEnc (src/)
-
-Anchor-based object tracking pipeline для построения Knowledge Graph из последовательности изображений.
+See `README.md` for overview. This file documents the source layout.
 
 ```
-src/
-├── all-in-one.ipynb          # Main notebook - unified pipeline
-├── processing.py             # Mask processing + filtering
-├── encoders/
-│   ├── dinov2.py             # DINOv2 visual encoder
-│   ├── naradio.py            # NaRadIO encoder (RADIO + language alignment)
-│   └── florence.py           # Florence-2 captioning
-├── segmentation/
-│   └── sam.py                # SAM 1/2 initialization
-├── utils/
-│   ├── anchors.py            # Anchor DB: create, update, export
-│   ├── matching.py           # Greedy & Hungarian matching
-│   ├── metrics.py            # Unsupervised quality metrics
-│   ├── tracking.py           # Track ID assignment
-│   └── visualization.py      # Visualizations
-└── output/                   # Saved anchor_db.pkl, mask_db.pkl
-```
-
-### Pipeline Flow
-```
-Image → SAM (masks) → Visual Encoder (embeddings) → Florence (captions)
-                                ↓
-                    Filter (category + size)
-                                ↓
-                    Matching (Hungarian/Greedy)
-                                ↓
-                    Anchor DB (accumulate observations)
-                                ↓
-                    Export → Knowledge Graph JSON
-```
-
----
-
-## vl-kgp
-
-Vision-Language Knowledge Graph Pipeline с chunk-based обработкой через Gemini.
-
-```
-vl-kgp/
-├── main.py                   # Entry point
-├── config/
-│   └── default.yaml          # Configuration (chunk_size, models, paths)
+aegis/
 ├── src/
-│   ├── core/
-│   │   ├── chunk_processing_pipeline.py    # Orchestrator - splits frames into chunks
-│   │   ├── efficient_chunk_object_detection.py  # Gemini API - detects objects in chunk
-│   │   └── cross_chunk_data_associator.py  # Merges objects across chunks via LLM
-│   └── utils/
-│       ├── api_provider.py   # Gemini/OpenRouter providers
-│       ├── config_manager.py # Config loading
-│       └── yaml_handler.py   # YAML parsing
-└── experiments/
-    ├── retrieval-based/      # GraphRAG with Neo4j
-    ├── full_knowledge_graph/ # Full KG baseline
-    └── chunkwise_retrieval/  # Per-chunk evaluation
+│   └── aegis/                  # Installable package (uv pip install -e .)
+│       ├── encoders/           # Visual encoders: DINOv2, Florence-2, NaRadIO
+│       ├── segmentation/       # SAM 1/2 initialization
+│       ├── config/             # YAML config loader + Pydantic schemas
+│       ├── graph/              # Knowledge graph: nodes, edges, exporters
+│       ├── pipeline/           # Pipeline orchestrator + chunk processor
+│       ├── preprocessing/      # Mask cropping utilities (MaskCropper)
+│       ├── storage/            # ChunkGraphStorage, file naming
+│       ├── tracking/           # Anchors, matching, tracking, bbox utils
+│       ├── metrics/            # Unsupervised quality metrics
+│       └── visualization/      # Mask/anchor/graph visualization
+│
+├── evaluation/
+│   ├── core/                   # Reusable eval modules
+│   │   ├── eval_metrics.py     # AUPRC, R@k metrics
+│   │   ├── model_infer.py      # MASt3R inference wrapper
+│   │   ├── segmentor.py        # FastSAM segmentation wrapper
+│   │   ├── ground_truth_generator.py
+│   │   └── vizenc_inference.py # VizEnc segment matcher
+│   ├── scripts/                # Runnable evaluation scripts
+│   ├── datasets/               # Dataset interfaces (Replica, VKITTI2)
+│   ├── sampling/               # Image pair sampling
+│   ├── configs/                # Eval YAML configs
+│   └── data/                   # pairs_*.json files
+│
+├── scripts/                    # CLI entry points
+├── notebooks/                  # Standalone pipeline notebooks/scripts
+├── visualization/              # Gradio web app for graph visualization
+├── configs/                    # Pipeline YAML configs
+├── third_party/                # README: what external repos to clone
+├── tests/
+└── data/                       # Assets (logo, diagrams)
 ```
 
-### Pipeline Flow
-```
-Frames → Split into chunks (8 frames default)
-              ↓
-    Gemini API (per chunk):
-    - objects: id, name, description, frames[], bbox
-    - spatial_relationships: subject, relation, object
-              ↓
-    CrossChunkDataAssociator:
-    - LLM fixes local IDs based on global summary
-    - Programmatic merge into accumulated KG
-              ↓
-    Final knowledge_graph.json
+## Installation
+
+```bash
+uv pip install -e .
 ```
 
-### Key Difference from vizEnc
-- **vizEnc**: Local visual encoders (DINOv2/NaRadIO) + embedding matching
-- **vl-kgp**: Cloud LLM (Gemini) does detection + tracking in one call per chunk
+## Third-Party Setup
 
----
-
-## Integration Ideas
-
-1. **vizEnc anchors → vl-kgp format**: Export anchors as vl-kgp compatible `knowledge_graph.json`
-2. **Hybrid**: Use vizEnc for reliable embeddings, vl-kgp for spatial relationships via LLM
-3. **Chunk-based processing**: Apply vl-kgp's chunk strategy to vizEnc for better scalability
+See `third_party/README.md` for required external repositories.

@@ -8,7 +8,7 @@ from pathlib import Path
 import pickle
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+# aegis is installed via: uv pip install -e .
 
 # Load the chunk
 chunk_file = Path('output/chunks').glob('*.pkl')

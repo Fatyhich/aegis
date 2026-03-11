@@ -9,10 +9,12 @@ __pycache__/
 pip-log.txt
 pip-delete-this-directory.txt
 
-segmast3r/
-segment-anything/
-vl-kgp/
-RayFronts/
+# Third-party repos cloned at root level (not in third_party/)
+/segmast3r/
+/segment-anything/
+/vl-kgp/
+/RayFronts/
+/sam2/
 data/
 
 nvidia-uvm
@@ -89,6 +91,7 @@ data/
 
 # Output and results directories
 output/
+results/
 src/output/
 src/results/
 visualization/output/

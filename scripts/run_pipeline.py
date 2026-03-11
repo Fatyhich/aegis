@@ -13,13 +13,9 @@ import argparse
 import sys
 from pathlib import Path
 
-# Add src to path
-src_dir = Path(__file__).parent.parent / "src"
-if str(src_dir) not in sys.path:
-    sys.path.insert(0, str(src_dir))
 
-from vizenc_baseline.config import load_all_configs
-from vizenc_baseline.pipeline import VizEncPipeline
+from aegis.config import load_all_configs
+from aegis.pipeline import VizEncPipeline
 
 
 def main():

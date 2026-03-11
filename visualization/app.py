@@ -12,10 +12,6 @@ import sys
 from pathlib import Path
 import argparse
 
-# Add src to path
-src_dir = Path(__file__).parent.parent / "src"
-if str(src_dir) not in sys.path:
-    sys.path.insert(0, str(src_dir))
 
 try:
     import gradio as gr
@@ -25,7 +21,7 @@ except ImportError:
     GRADIO_AVAILABLE = False
     sys.exit(1)
 
-from vizenc_baseline.graph.exporters import PickleExporter, JSONExporter
+from aegis.graph.exporters import PickleExporter, JSONExporter
 from PIL import Image, ImageDraw
 from collections import defaultdict
 import numpy as np

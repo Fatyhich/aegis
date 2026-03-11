@@ -1,0 +1,3 @@
+[submodule "third_party/segmast3r"]
+	path = third_party/segmast3r
+	url = git@github.com:SegMASt3R/segmast3r.git
