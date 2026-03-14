@@ -97,7 +97,7 @@ def train(cfg, mock=False, resume=None):
         collate_fn = mock_collate
     else:
         from training.data.dataset import ScanNetPPSegDataset, get_collate_fn
-        feat_root = getattr(cfg.DATASET, "PRECOMPUTED_FEAT_ROOT", "") or None
+        pair_dsc_root = getattr(cfg.DATASET, "PAIR_DSC_ROOT", "") or None
         ds_full = ScanNetPPSegDataset(
             metadata_path=cfg.DATASET.METADATA_PATH,
             processed_root=cfg.DATASET.DATA_ROOT,
@@ -105,7 +105,7 @@ def train(cfg, mock=False, resume=None):
             pairs_root=cfg.DATASET.PAIRS_ROOT,
             target_size=max(cfg.DATASET.HEIGHT, cfg.DATASET.WIDTH),
             resize_mode=cfg.DATASET.RESIZE_MODE,
-            feat_root=feat_root,
+            pair_dsc_root=pair_dsc_root or "",
         )
         n_total = len(ds_full)
         n_val   = max(1, int(n_total * cfg.DATASET.VAL_FRACTION))
@@ -138,9 +138,9 @@ def train(cfg, mock=False, resume=None):
     # ── Model / loss / metrics ────────────────────────────────────
     arch = getattr(cfg.MODEL, "ARCH", "sinkhorn")
 
-    if not mock and feat_root and arch != "lightglue":
+    if not mock and pair_dsc_root and arch != "lightglue":
         raise ValueError(
-            f"PRECOMPUTED_FEAT_ROOT is set but ARCH='{arch}' does not support "
+            f"PAIR_DSC_ROOT is set but ARCH='{arch}' does not support "
             f"precomputed descriptors. Only arch='lightglue' supports this mode."
         )
 

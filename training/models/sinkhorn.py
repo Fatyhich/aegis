@@ -55,27 +55,36 @@ class SegMASt3R(nn.Module):
             p.requires_grad_(False)
 
     # ------------------------------------------------------------------
-    def extract_desc(self, imgs: torch.Tensor) -> torch.Tensor:
+    def extract_desc(
+        self, img0: torch.Tensor, img1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Extract dense per-pixel descriptors from MASt3R.
+        Extract dense per-pixel descriptors from MASt3R using cross-pair.
 
-        Per MASt3R docs: call model(view1, view2) directly.
-        true_shape is optional — inferred from img.shape[-2:].
-        We run each image as a self-pair (view1 = view2 = same img).
+        MASt3R decoder uses cross-attention between view0 and view1.
+        Both views must be different images for meaningful descriptors.
 
         Args:
-            imgs: (B, 3, H, W) normalized [-1, 1]
+            img0: (B, 3, H, W) normalized [-1, 1]
+            img1: (B, 3, H, W) normalized [-1, 1]
         Returns:
-            desc: (B, DESC_DIM, H, W)
+            desc0: (B, DESC_DIM, H, W)
+            desc1: (B, DESC_DIM, H, W)
         """
-        B = imgs.shape[0]
-        view = {
-            "img": imgs,
-            "instance": [str(i) for i in range(B)],  # уникальные → is_symmetrized=False
+        B = img0.shape[0]
+        view0 = {
+            "img": img0,
+            "instance": [f"0_{i}" for i in range(B)],
+        }
+        view1 = {
+            "img": img1,
+            "instance": [f"1_{i}" for i in range(B)],
         }
         with torch.no_grad():
-            pred1, _ = self.backbone(view, view)
-        return pred1["desc"].permute(0, 3, 1, 2).contiguous()
+            pred0, pred1 = self.backbone(view0, view1)
+        desc0 = pred0["desc"].permute(0, 3, 1, 2).contiguous()
+        desc1 = pred1["desc"].permute(0, 3, 1, 2).contiguous()
+        return desc0, desc1
 
     # ------------------------------------------------------------------
     def forward(
@@ -91,8 +100,7 @@ class SegMASt3R(nn.Module):
             dsc0:  (B, 24, M)     segment descriptors img0
             dsc1:  (B, 24, N)     segment descriptors img1
         """
-        feat0 = self.extract_desc(img0)   # (B, 24, H, W)
-        feat1 = self.extract_desc(img1)
+        feat0, feat1 = self.extract_desc(img0, img1)   # (B, 24, H, W) each
 
         # Align masks spatial size to descriptor grid (should match, but safe)
         _, _, dH, dW = feat0.shape

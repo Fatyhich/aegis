@@ -42,7 +42,7 @@ _CN.DATASET.HEIGHT        = 336
 _CN.DATASET.WIDTH         = 512
 _CN.DATASET.RESIZE_MODE   = "square"    # square | longest_side
 _CN.DATASET.VAL_FRACTION          = 0.02
-_CN.DATASET.PRECOMPUTED_FEAT_ROOT = ""  # path to precomputed pooled descriptors; "" = disabled
+_CN.DATASET.PAIR_DSC_ROOT = ""  # per-pair precomputed descriptors; "" = online backbone
 
 # ── Training ──────────────────────────────────────────────────────
 _CN.TRAINING = CN()

@@ -24,7 +24,7 @@ DATASET:
   WIDTH:  512
   RESIZE_MODE: square
   VAL_FRACTION: 0.02
-  PRECOMPUTED_FEAT_ROOT: /mnt/vol1/shared/datasets/master_precompute_feat
+  PAIR_DSC_ROOT: ""  # set to per-pair precompute path when ready
 
 TRAINING:
   BATCH_SIZE:      32

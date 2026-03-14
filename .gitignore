@@ -15,7 +15,7 @@ pip-delete-this-directory.txt
 /vl-kgp/
 /RayFronts/
 /sam2/
-data/
+/data/
 
 nvidia-uvm
 nvidia-uvm-tools
@@ -84,7 +84,7 @@ ipython_config.py
 *.feather
 *.h5
 *.hdf5
-data/
+/data/
 *.pickle
 *.pkl
 *.joblib

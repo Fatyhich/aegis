@@ -97,19 +97,33 @@ class SegMASt3RLG(nn.Module):
 
     # ------------------------------------------------------------------
 
-    def extract_desc(self, imgs: torch.Tensor) -> torch.Tensor:
+    def extract_desc(
+        self, img0: torch.Tensor, img1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        imgs: (B, 3, H, W) normalized [-1, 1]
-        Returns: (B, 24, H, W)
+        Extract dense per-pixel descriptors from MASt3R using cross-pair.
+
+        Args:
+            img0: (B, 3, H, W) normalized [-1, 1]
+            img1: (B, 3, H, W) normalized [-1, 1]
+        Returns:
+            desc0: (B, 24, H, W)
+            desc1: (B, 24, H, W)
         """
-        B = imgs.shape[0]
-        view = {
-            "img": imgs,
-            "instance": [str(i) for i in range(B)],
+        B = img0.shape[0]
+        view0 = {
+            "img": img0,
+            "instance": [f"0_{i}" for i in range(B)],
+        }
+        view1 = {
+            "img": img1,
+            "instance": [f"1_{i}" for i in range(B)],
         }
         with torch.no_grad():
-            pred1, _ = self.backbone(view, view)
-        return pred1["desc"].permute(0, 3, 1, 2).contiguous()  # (B, 24, H, W)
+            pred0, pred1 = self.backbone(view0, view1)
+        desc0 = pred0["desc"].permute(0, 3, 1, 2).contiguous()
+        desc1 = pred1["desc"].permute(0, 3, 1, 2).contiguous()
+        return desc0, desc1
 
     # ------------------------------------------------------------------
 
@@ -145,8 +159,7 @@ class SegMASt3RLG(nn.Module):
             dsc1 = dsc1_pre.transpose(1, 2).to(dtype=self.proj.weight.dtype)  # (B, 24, N)
         else:
             # ── Extract frozen backbone features ──────────────────────────
-            feat0 = self.extract_desc(img0)   # (B, 24, H, W)
-            feat1 = self.extract_desc(img1)
+            feat0, feat1 = self.extract_desc(img0, img1)   # (B, 24, H, W) each
 
             # Resize masks to descriptor grid if needed
             _, _, dH, dW = feat0.shape
