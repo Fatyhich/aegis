@@ -9,7 +9,7 @@ _CN = CN()
 # ── Model ─────────────────────────────────────────────────────────
 _CN.MODEL = CN()
 _CN.MODEL.MAST3R_CKPT = ""
-_CN.MODEL.ARCH        = "sinkhorn"   # sinkhorn | lightglue
+_CN.MODEL.ARCH        = "sinkhorn"   # sinkhorn | lightglue | lightglue_v2
 
 # LightGlue-style architecture params (MODEL.ARCH = "lightglue")
 _CN.MODEL.LG = CN()
@@ -19,6 +19,12 @@ _CN.MODEL.LG.N_HEADS             = 4     # attention heads
 _CN.MODEL.LG.GRAD_CHECKPOINT     = False # gradient checkpointing (saves VRAM)
 _CN.MODEL.LG.DEEP_SUPERVISION    = False # compute loss at every layer
 _CN.MODEL.LG.LAMBDA_MATCH        = 1.0   # weight for matchability BCE loss
+
+# LightGlue v2 extra params (MODEL.ARCH = "lightglue_v2")
+# Shared params (PROJ_DIM, N_LAYERS, etc.) are read from MODEL.LG.
+_CN.MODEL.LG_V2 = CN()
+_CN.MODEL.LG_V2.PROJ_MID_DIM     = 64    # MLP projector hidden dim (24→mid→proj_dim)
+_CN.MODEL.LG_V2.FFN_EXPANSION    = 4     # FFN multiplier (v1 uses 2×, v2 uses 4×)
 
 # ── Misc ──────────────────────────────────────────────────────────
 _CN.DEBUG    = False

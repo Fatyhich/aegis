@@ -32,6 +32,17 @@
 - Three-level adaptive hierarchy: anchor nodes → associated objects → atomic objects
 - RGB-only processing (no depth required) via VLMs
 - SegMASt3R training: frozen MASt3R backbone + Sinkhorn OT matcher
+- Two model variants: Sinkhorn (`training/models/sinkhorn.py`) and LightGlue (`training/models/lightglue.py`)
+- MAX_MASKS = 100 (paper M=100)
+
+## Training Pipeline — Critical Design Constraint
+MASt3R decoder uses cross-attention between view0 and view1. Descriptors for img0
+DEPEND on which img1 it's paired with. Consequences:
+- `extract_desc(img0, img1)` must receive BOTH images → `backbone(view0, view1)`
+- Per-image precompute is INVALID — only per-pair precompute works
+- Precompute output: `<pair_dsc_root>/<scene>/<name_i>__<name_j>.pt` → `{"dsc0": (M,24), "dsc1": (N,24)}`
+- Config key: `DATASET.PAIR_DSC_ROOT` (old `PRECOMPUTED_FEAT_ROOT` is deprecated/removed)
+- Precomputed mode only supported for LightGlue arch (sinkhorn uses online backbone)
 
 ## Experiment Tracking
 - All runs logged to TensorBoard
@@ -39,6 +50,11 @@
 - Never overwrite a run, create new one
 - Checkpoints: /mnt/vol1/checkpoints/fatykhich/<run_name>/
 - Local results: results/segmast3r_repro/
+
+## Known Issues (evaluation/)
+- `evaluation/core/model_infer.py:65` — `if dataset_type == "mapfree" or "hm3d"` always True
+- `evaluation/datasets/replica_dataset.py:19` — bare import `from ground_truth_generator` fails
+- `evaluation/scripts/eval_vizenc_vkitti2.py:454` — `Image.fromarray` on int32 crashes
 
 ## After Every Change
 1. Review diff for style compliance (ruff)

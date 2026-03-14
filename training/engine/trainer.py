@@ -138,10 +138,10 @@ def train(cfg, mock=False, resume=None):
     # ── Model / loss / metrics ────────────────────────────────────
     arch = getattr(cfg.MODEL, "ARCH", "sinkhorn")
 
-    if not mock and pair_dsc_root and arch != "lightglue":
+    if not mock and pair_dsc_root and arch not in ("lightglue", "lightglue_v2"):
         raise ValueError(
             f"PAIR_DSC_ROOT is set but ARCH='{arch}' does not support "
-            f"precomputed descriptors. Only arch='lightglue' supports this mode."
+            f"precomputed descriptors. Only lightglue/lightglue_v2 support this mode."
         )
 
     matcher_cfg = {
@@ -205,6 +205,46 @@ def train(cfg, mock=False, resume=None):
                                            lambda_match=_lambda)
             def metrics_fn(output, seg_corr, masks0, masks1):
                 lm, m0, _ = output[0][-1]   # last layer
+                return compute_matching_metrics_lg(lm, m0, seg_corr, masks0, masks1)
+            def score_mat(output, b, M, N):
+                return output[0][-1][0][b, :M, :N].cpu()
+        else:
+            def loss_fn(output, seg_corr, masks0, masks1):
+                return lightglue_loss(output[0], output[1], output[2],
+                                      seg_corr, masks0, masks1, lambda_match=_lambda)
+            def metrics_fn(output, seg_corr, masks0, masks1):
+                return compute_matching_metrics_lg(output[0], output[1],
+                                                   seg_corr, masks0, masks1)
+            def score_mat(output, b, M, N):
+                return output[0][b, :M, :N].cpu()
+
+    elif arch == "lightglue_v2":
+        from training.models.lightglue_v2 import (
+            SegMASt3RLGv2, lightglue_loss, lightglue_loss_deep,
+            compute_matching_metrics_lg,
+        )
+        lg    = cfg.MODEL.LG
+        lg_v2 = cfg.MODEL.LG_V2
+        if not mock:
+            model = SegMASt3RLGv2(
+                mast3r_ckpt=cfg.MODEL.MAST3R_CKPT,
+                proj_dim=lg.PROJ_DIM,
+                proj_mid_dim=lg_v2.PROJ_MID_DIM,
+                n_layers=lg.N_LAYERS,
+                n_heads=lg.N_HEADS,
+                ffn_expansion=lg_v2.FFN_EXPANSION,
+                use_grad_checkpoint=lg.GRAD_CHECKPOINT,
+                deep_supervision=lg.DEEP_SUPERVISION,
+                device="cpu",
+            )
+        _deep   = lg.DEEP_SUPERVISION
+        _lambda = lg.LAMBDA_MATCH
+        if _deep:
+            def loss_fn(output, seg_corr, masks0, masks1):
+                return lightglue_loss_deep(output[0], seg_corr, masks0, masks1,
+                                           lambda_match=_lambda)
+            def metrics_fn(output, seg_corr, masks0, masks1):
+                lm, m0, _ = output[0][-1]
                 return compute_matching_metrics_lg(lm, m0, seg_corr, masks0, masks1)
             def score_mat(output, b, M, N):
                 return output[0][-1][0][b, :M, :N].cpu()
