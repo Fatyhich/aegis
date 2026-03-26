@@ -304,15 +304,20 @@ def compute_matching_metrics_lg(
 ) -> dict:
     """
     matching_accuracy — fraction of GT pairs where row-wise argmax is correct
+    recall_at_1       — same as matching_accuracy
+    recall_at_5       — fraction of GT pairs where correct target is in top-5
+    auprc             — Area Under Precision-Recall Curve
     mean_gt_logprob   — mean log_mutual[i,j] for GT pairs
-    unmatch_rate      — fraction of segments predicted as unmatched (matchability < 0)
-                        analogous to dustbin_rate in the sinkhorn version
+    dustbin_rate      — fraction of segments predicted as unmatched (matchability < 0)
     """
     total_correct = 0
+    total_correct_top5 = 0
     total_gt      = 0
     total_logprob = 0.0
     total_segs    = 0
     total_unmatch = 0
+    all_scores = []
+    all_labels = []
 
     for b in range(log_mutual.shape[0]):
         M    = masks0_list[b].shape[0]
@@ -323,18 +328,38 @@ def compute_matching_metrics_lg(
 
         if corr.shape[0] > 0:
             pred_j = lm.argmax(dim=1)   # (M,)
+            _, topk_j = lm.topk(min(5, N), dim=1)  # (M, min(5,N))
+
+            gt_map = {}
             for k in range(corr.shape[0]):
                 i0, j0 = corr[k, 0].item(), corr[k, 1].item()
                 if i0 < M and j0 < N:
                     total_correct += int(pred_j[i0].item() == j0)
+                    total_correct_top5 += int(j0 in topk_j[i0].tolist())
                     total_gt      += 1
                     total_logprob += lm[i0, j0].item()
+                    gt_map[i0] = j0
+
+            # AUPRC: for each matched row, collect scores
+            for i0, j0 in gt_map.items():
+                row_scores = lm[i0]  # (N,)
+                for j in range(N):
+                    all_scores.append(row_scores[j].item())
+                    all_labels.append(1.0 if j == j0 else 0.0)
 
         total_segs    += M
         total_unmatch += (m0_b < 0).sum().item()   # sigmoid < 0.5 → predicted unmatched
 
+    auprc = 0.0
+    if all_scores:
+        from training.engine.utils import _compute_auprc
+        auprc = _compute_auprc(torch.tensor(all_scores), torch.tensor(all_labels))
+
     return {
-        "matching_accuracy": total_correct / max(total_gt,   1),
-        "mean_gt_logprob":   total_logprob / max(total_gt,   1),
-        "dustbin_rate":      total_unmatch / max(total_segs, 1),  # same key for TB logging
+        "matching_accuracy": total_correct / max(total_gt, 1),
+        "recall_at_1":       total_correct / max(total_gt, 1),
+        "recall_at_5":       total_correct_top5 / max(total_gt, 1),
+        "auprc":             auprc,
+        "mean_gt_logprob":   total_logprob / max(total_gt, 1),
+        "dustbin_rate":      total_unmatch / max(total_segs, 1),
     }

@@ -19,31 +19,117 @@ Key facts confirmed from MASt3R source + README:
   - pred['desc']: (B, H, W, 24)  — HWC layout, output_mode='pts3d+desc24'
   - true_shape is optional — inferred from img.shape[-2:] if absent
   - Trainable params: only Sinkhorn dustbin_score (~1 scalar)
+
+Two modes:
+  - Online: backbone(img0, img1) → pooling → matcher  (requires segmast3r submodule)
+  - Precomputed: dsc0_pre/dsc1_pre → matcher only      (no submodule needed)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from training.paths import setup_segmast3r_path
-setup_segmast3r_path()
 
-from src.models.mast3r_segfeat.diff_masked_pooling import masked_average_pooling
-from src.models.mast3r_segfeat.diff_feature_matcher import featureMatcher
+# ---------------------------------------------------------------------------
+# Sinkhorn OT matcher (inlined from segmast3r diff_feature_matcher.py)
+# ---------------------------------------------------------------------------
 
+class SinkhornMatcher(nn.Module):
+    """Log-domain Sinkhorn optimal transport matcher with learnable dustbin."""
+
+    def __init__(self, num_iterations: int = 50, dustbin_score_init: float = 1.0):
+        super().__init__()
+        self.dustbin_score = nn.Parameter(torch.tensor(dustbin_score_init))
+        self.num_iterations = num_iterations
+
+    def forward(self, dsc0: torch.Tensor, dsc1: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            dsc0: (B, D, M) segment descriptors for image 0
+            dsc1: (B, D, N) segment descriptors for image 1
+        Returns:
+            log_P: (B, M+1, N+1) log-assignment with dustbin
+        """
+        scores = torch.einsum("bdn,bdm->bnm", dsc0, dsc1)  # (B, M, N)
+        return self._log_optimal_transport(scores, self.dustbin_score, self.num_iterations)
+
+    @staticmethod
+    def _log_sinkhorn(Z, log_mu, log_nu, iters):
+        u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
+        for _ in range(iters):
+            u = log_mu - torch.logsumexp(Z + v.unsqueeze(1), dim=2)
+            v = log_nu - torch.logsumexp(Z + u.unsqueeze(2), dim=1)
+        return Z + u.unsqueeze(2) + v.unsqueeze(1)
+
+    def _log_optimal_transport(self, scores, alpha, iters):
+        b, m, n = scores.shape
+        one = scores.new_tensor(1)
+        ms, ns = (m * one).to(scores), (n * one).to(scores)
+
+        bins0 = alpha.expand(b, m, 1)
+        bins1 = alpha.expand(b, 1, n)
+        alpha_corner = alpha.expand(b, 1, 1)
+
+        couplings = torch.cat(
+            [torch.cat([scores, bins0], -1),
+             torch.cat([bins1, alpha_corner], -1)], 1)
+
+        norm = -(ms + ns).log()
+        log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
+        log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
+        log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
+
+        Z = self._log_sinkhorn(couplings, log_mu, log_nu, iters)
+        Z = Z - norm
+        return Z
+
+
+# ---------------------------------------------------------------------------
+# Masked average pooling (inlined from segmast3r diff_masked_pooling.py)
+# ---------------------------------------------------------------------------
+
+def _masked_average_pooling(feat: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+        feat:  (B, D, H, W) dense feature map
+        masks: (B, M, H, W) binary masks
+    Returns:
+        (B, D, M) per-segment descriptors
+    """
+    B, D, H, W = feat.shape
+    M = masks.shape[1]
+    feat_flat = feat.view(B, D, H * W)              # (B, D, HW)
+    masks_flat = masks.view(B, M, H * W).float()     # (B, M, HW)
+    area = masks_flat.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, M, 1)
+    # (B, D, HW) @ (B, HW, M) → (B, D, M)
+    return torch.bmm(feat_flat, masks_flat.transpose(1, 2)) / area.transpose(1, 2)
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 class SegMASt3R(nn.Module):
 
     DESC_DIM = 24  # confirmed: output_mode='pts3d+desc24'
 
-    def __init__(self, mast3r_ckpt: str, matcher_cfg: dict, device: str = "cuda"):
+    def __init__(self, mast3r_ckpt: str, matcher_cfg: dict, device: str = "cuda",
+                 precompute_mode: bool = False):
         super().__init__()
-        self.backbone = self._load_backbone(mast3r_ckpt, device)
-        self._freeze(self.backbone)
-        self.matcher = featureMatcher(matcher_cfg)
+        self.matcher = SinkhornMatcher(
+            num_iterations=matcher_cfg["SINKHORN"]["NUM_IT"],
+            dustbin_score_init=matcher_cfg["SINKHORN"]["DUSTBIN_SCORE_INIT"],
+        )
+        if not precompute_mode:
+            self.backbone = self._load_backbone(mast3r_ckpt, device)
+            self._freeze(self.backbone)
+        else:
+            self.backbone = None
 
     @staticmethod
     def _load_backbone(ckpt_path: str, device: str):
+        from training.paths import setup_segmast3r_path
+        setup_segmast3r_path()
         from mast3r_src.mast3r.model import load_model
         model = load_model(ckpt_path, device=device, verbose=True)
         model.eval()
@@ -60,9 +146,6 @@ class SegMASt3R(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Extract dense per-pixel descriptors from MASt3R using cross-pair.
-
-        MASt3R decoder uses cross-attention between view0 and view1.
-        Both views must be different images for meaningful descriptors.
 
         Args:
             img0: (B, 3, H, W) normalized [-1, 1]
@@ -89,10 +172,13 @@ class SegMASt3R(nn.Module):
     # ------------------------------------------------------------------
     def forward(
         self,
-        img0: torch.Tensor,    # (B, 3, H, W)
-        img1: torch.Tensor,    # (B, 3, H, W)
-        masks0: torch.Tensor,  # (B, M, H, W) float
-        masks1: torch.Tensor,  # (B, N, H, W) float
+        img0: torch.Tensor | None,    # (B, 3, H, W) or None if precomputed
+        img1: torch.Tensor | None,    # (B, 3, H, W) or None if precomputed
+        masks0: torch.Tensor = None,  # (B, M, H, W) float — required for online
+        masks1: torch.Tensor = None,  # (B, N, H, W) float — required for online
+        *,
+        dsc0_pre: torch.Tensor = None,  # (B, M, 24) precomputed segment descriptors
+        dsc1_pre: torch.Tensor = None,  # (B, N, 24) precomputed segment descriptors
     ):
         """
         Returns:
@@ -100,16 +186,21 @@ class SegMASt3R(nn.Module):
             dsc0:  (B, 24, M)     segment descriptors img0
             dsc1:  (B, 24, N)     segment descriptors img1
         """
-        feat0, feat1 = self.extract_desc(img0, img1)   # (B, 24, H, W) each
+        if dsc0_pre is not None:
+            # Precomputed mode: (B, M, 24) → (B, 24, M) to match matcher layout
+            dsc0 = dsc0_pre.permute(0, 2, 1).contiguous()
+            dsc1 = dsc1_pre.permute(0, 2, 1).contiguous()
+        else:
+            feat0, feat1 = self.extract_desc(img0, img1)   # (B, 24, H, W) each
 
-        # Align masks spatial size to descriptor grid (should match, but safe)
-        _, _, dH, dW = feat0.shape
-        if masks0.shape[-2:] != (dH, dW):
-            masks0 = F.interpolate(masks0.float(), (dH, dW), mode="nearest")
-            masks1 = F.interpolate(masks1.float(), (dH, dW), mode="nearest")
+            # Align masks spatial size to descriptor grid (should match, but safe)
+            _, _, dH, dW = feat0.shape
+            if masks0.shape[-2:] != (dH, dW):
+                masks0 = F.interpolate(masks0.float(), (dH, dW), mode="nearest")
+                masks1 = F.interpolate(masks1.float(), (dH, dW), mode="nearest")
 
-        dsc0 = masked_average_pooling(feat0, masks0.float())  # (B, 24, M)
-        dsc1 = masked_average_pooling(feat1, masks1.float())  # (B, 24, N)
+            dsc0 = _masked_average_pooling(feat0, masks0.float())  # (B, 24, M)
+            dsc1 = _masked_average_pooling(feat1, masks1.float())  # (B, 24, N)
 
         log_P = self.matcher(dsc0, dsc1)   # (B, M+1, N+1)
         return log_P, dsc0, dsc1

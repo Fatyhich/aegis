@@ -146,8 +146,8 @@ class ScanNetPPSegDataset(Dataset):
 
         self.pairs = self._filter_pairs(raw_pairs)
 
-        # Build image path cache (only needed if not using precomputed descriptors)
-        self._img_path_cache = {} if self.pair_dsc_root else self._build_img_cache()
+        # Always build image path cache (needed for val visualization even in precomputed mode)
+        self._img_path_cache = self._build_img_cache()
 
         dsc_info = f" | pair_dsc_root='{pair_dsc_root}'" if pair_dsc_root else ""
         print(f"ScanNetPPSegDataset: {len(self.pairs):,} pairs "
@@ -251,32 +251,39 @@ class ScanNetPPSegDataset(Dataset):
             _, H0, W0 = img0.shape
             _, H1, W1 = img1.shape
 
-        # ── Load RLE pickles ───────────────────────────────────────────
+        # ── Masks ─────────────────────────────────────────────────────
+        # In precomputed mode, masks are only used for .shape[0] (segment count)
+        # in loss/metrics. The actual pixel data was already consumed during
+        # precompute to produce dsc0/dsc1. Skip expensive RLE decode.
         _t2 = time.perf_counter() if self._profile else 0.0
-        with open(self._mask_pkl(idx_i), "rb") as f:
-            rles0 = pickle.load(f)["mask_coco_rles_resized"]
-        with open(self._mask_pkl(idx_j), "rb") as f:
-            rles1 = pickle.load(f)["mask_coco_rles_resized"]
-
-        # ── Decode RLEs + resize ───────────────────────────────────────
-        _t3 = time.perf_counter() if self._profile else 0.0
-        if rles0:
-            masks0 = _decode_rles_batched(rles0[:self.max_masks])
-            if masks0.shape[-2:] != (H0, W0):
-                masks0 = _resize_masks(masks0, (H0, W0))
+        if self.pair_dsc_root is not None:
+            M0, M1 = dsc0.shape[0], dsc1.shape[0]
+            masks0 = torch.zeros(M0, 1, 1, dtype=torch.uint8)
+            masks1 = torch.zeros(M1, 1, 1, dtype=torch.uint8)
         else:
-            masks0 = torch.zeros(0, H0, W0, dtype=torch.uint8)
+            with open(self._mask_pkl(idx_i), "rb") as f:
+                rles0 = pickle.load(f)["mask_coco_rles_resized"]
+            with open(self._mask_pkl(idx_j), "rb") as f:
+                rles1 = pickle.load(f)["mask_coco_rles_resized"]
 
-        if rles1:
-            masks1 = _decode_rles_batched(rles1[:self.max_masks])
-            if masks1.shape[-2:] != (H1, W1):
-                masks1 = _resize_masks(masks1, (H1, W1))
-        else:
-            masks1 = torch.zeros(0, H1, W1, dtype=torch.uint8)
+            _t3 = time.perf_counter() if self._profile else 0.0
+            if rles0:
+                masks0 = _decode_rles_batched(rles0[:self.max_masks])
+                if masks0.shape[-2:] != (H0, W0):
+                    masks0 = _resize_masks(masks0, (H0, W0))
+            else:
+                masks0 = torch.zeros(0, H0, W0, dtype=torch.uint8)
 
-        masks0 = masks0.to(torch.uint8)
-        masks1 = masks1.to(torch.uint8)
-        M0, M1 = masks0.shape[0], masks1.shape[0]
+            if rles1:
+                masks1 = _decode_rles_batched(rles1[:self.max_masks])
+                if masks1.shape[-2:] != (H1, W1):
+                    masks1 = _resize_masks(masks1, (H1, W1))
+            else:
+                masks1 = torch.zeros(0, H1, W1, dtype=torch.uint8)
+
+            masks0 = masks0.to(torch.uint8)
+            masks1 = masks1.to(torch.uint8)
+            M0, M1 = masks0.shape[0], masks1.shape[0]
 
         # ── Correspondences ────────────────────────────────────────────
         with open(self._pair_pkl(idx_i, idx_j), "rb") as f:
@@ -318,9 +325,11 @@ class ScanNetPPSegDataset(Dataset):
         if dsc0 is not None:
             out["dsc0"] = dsc0
             out["dsc1"] = dsc1
-            # Image paths for lazy visualization in validator
-            out["img_path_i"] = str(self._get_img_path(idx_i)) if self._img_path_cache else ""
-            out["img_path_j"] = str(self._get_img_path(idx_j)) if self._img_path_cache else ""
+            # Paths for lazy visualization in validator (load only for vis batches)
+            out["img_path_i"]  = str(self._img_path_cache.get(idx_i, ""))
+            out["img_path_j"]  = str(self._img_path_cache.get(idx_j, ""))
+            out["mask_path_i"] = str(self._mask_pkl(idx_i))
+            out["mask_path_j"] = str(self._mask_pkl(idx_j))
         else:
             out["img0"] = img0
             out["img1"] = img1
@@ -344,8 +353,10 @@ def collate_fn_square(batch):
     if "dsc0" in batch[0]:
         out["dsc0"]       = [b["dsc0"] for b in batch]
         out["dsc1"]       = [b["dsc1"] for b in batch]
-        out["img_path_i"] = [b["img_path_i"] for b in batch]
-        out["img_path_j"] = [b["img_path_j"] for b in batch]
+        out["img_path_i"]  = [b["img_path_i"]  for b in batch]
+        out["img_path_j"]  = [b["img_path_j"]  for b in batch]
+        out["mask_path_i"] = [b["mask_path_i"] for b in batch]
+        out["mask_path_j"] = [b["mask_path_j"] for b in batch]
     else:
         out["img0"] = torch.stack([b["img0"] for b in batch])
         out["img1"] = torch.stack([b["img1"] for b in batch])
@@ -365,8 +376,10 @@ def collate_fn_longest_side(batch):
     if "dsc0" in batch[0]:
         out["dsc0"]       = [b["dsc0"] for b in batch]
         out["dsc1"]       = [b["dsc1"] for b in batch]
-        out["img_path_i"] = [b["img_path_i"] for b in batch]
-        out["img_path_j"] = [b["img_path_j"] for b in batch]
+        out["img_path_i"]  = [b["img_path_i"]  for b in batch]
+        out["img_path_j"]  = [b["img_path_j"]  for b in batch]
+        out["mask_path_i"] = [b["mask_path_i"] for b in batch]
+        out["mask_path_j"] = [b["mask_path_j"] for b in batch]
     else:
         out["img0"] = [b["img0"] for b in batch]
         out["img1"] = [b["img1"] for b in batch]
