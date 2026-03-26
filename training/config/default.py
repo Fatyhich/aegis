@@ -9,7 +9,13 @@ _CN = CN()
 # ── Model ─────────────────────────────────────────────────────────
 _CN.MODEL = CN()
 _CN.MODEL.MAST3R_CKPT = ""
-_CN.MODEL.ARCH        = "sinkhorn"   # sinkhorn | lightglue | lightglue_v2
+_CN.MODEL.ARCH        = "sinkhorn"   # sinkhorn | lightglue | lightglue_v2 | vggt | vggt_dpt
+_CN.MODEL.VGGT_CKPT      = "facebook/VGGT-1B"  # local .pt path or HF model id
+_CN.MODEL.VGGT_LAYER_IDX = 23                   # aggregator layer index (0–23), single-layer mode
+_CN.MODEL.VGGT_LAYER_INDICES = (5, 11, 17, 23)  # multi-layer extraction for DPT fusion
+_CN.MODEL.VGGT_FUSION_DIM    = 256              # DPT fusion output dim (D_hat)
+_CN.MODEL.MATCHABILITY_BIAS  = 0.0             # init bias for matchability logit (>0 → less dustbin)
+_CN.MODEL.TEMPERATURE_INIT   = 1.0             # learnable temperature init (1.0 = neutral)
 
 # LightGlue-style architecture params (MODEL.ARCH = "lightglue")
 _CN.MODEL.LG = CN()
@@ -48,6 +54,7 @@ _CN.DATASET.HEIGHT        = 336
 _CN.DATASET.WIDTH         = 512
 _CN.DATASET.RESIZE_MODE   = "square"    # square | longest_side
 _CN.DATASET.VAL_FRACTION          = 0.02
+_CN.DATASET.MAX_PAIRS     = 0   # 0 = use all pairs; >0 = cap dataset size (before train/val split)
 _CN.DATASET.PAIR_DSC_ROOT = ""  # per-pair precomputed descriptors; "" = online backbone
 
 # ── Training ──────────────────────────────────────────────────────
@@ -63,10 +70,12 @@ _CN.TRAINING.LR_SCHEDULER    = "cosine"  # cosine | none
 _CN.TRAINING.WARMUP_STEPS    = 500
 _CN.TRAINING.LOG_INTERVAL    = 100
 _CN.TRAINING.VAL_INTERVAL    = 5000
+_CN.TRAINING.VAL_MAX_BATCHES = 0      # 0 = full val set; >0 = subsample (prevents NCCL timeout)
 _CN.TRAINING.SAVE_INTERVAL   = 5000
 
 # ── Accelerate ────────────────────────────────────────────────────
 _CN.ACCELERATE = CN()
 _CN.ACCELERATE.MIXED_PRECISION = "no"   # no | bf16 | fp16
+_CN.ACCELERATE.GRADIENT_ACCUMULATION_STEPS = 1
 
 cfg = _CN

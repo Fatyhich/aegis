@@ -104,30 +104,49 @@ def run_validation(model, loader_val, device, accelerator,
                    writer=None, global_step=0,
                    n_vis_batches: int = 4,
                    vis_img_size: int = 512,
-                   vis_resize_mode: str = "square") -> dict:
+                   vis_resize_mode: str = "square",
+                   max_batches: int = 0) -> dict:
     """
     Full validation pass → aggregated metrics dict (gathered across all processes).
     Saves n_vis_batches visualizations to TensorBoard (main process only).
+
+    IMPORTANT: uses accelerator.unwrap_model() to bypass DDP wrapper.
+    DDP forward hooks expect a backward pass; calling DDP-wrapped model in
+    eval/no_grad corrupts its internal state and causes NCCL desync on the
+    next training step.
 
     loss_fn(output, seg_corr, masks0, masks1)  → scalar tensor
     metrics_fn(output, seg_corr, masks0, masks1) → dict
     score_mat_fn(output, b, M, N) → (M, N) cpu tensor for vis
     """
-    agg = {"loss": [], "matching_accuracy": [], "mean_gt_logprob": [], "dustbin_rate": []}
+    # Unwrap DDP — forward passes during validation must NOT go through
+    # the DDP wrapper to avoid registering gradient hooks that never fire.
+    unwrapped = accelerator.unwrap_model(model)
+
+    agg = {
+        "loss": [], "matching_accuracy": [], "mean_gt_logprob": [], "dustbin_rate": [],
+        "recall_at_1": [], "recall_at_5": [], "auprc": [],
+        "false_dustbin_rate": [], "wrong_match_rate": [], "false_match_rate": [],
+    }
     vis_count = 0
 
-    for batch in tqdm(loader_val, desc="  Val", leave=False, dynamic_ncols=True,
-                      disable=not accelerator.is_local_main_process):
+    for batch_idx, batch in enumerate(tqdm(
+        loader_val, desc="  Val", leave=False, dynamic_ncols=True,
+        disable=not accelerator.is_local_main_process,
+        total=max_batches if max_batches > 0 else None,
+    )):
+        if max_batches > 0 and batch_idx >= max_batches:
+            break
         if "dsc0" in batch:
             dsc0   = pad_descriptors_to_batch(batch["dsc0"], device)
             dsc1   = pad_descriptors_to_batch(batch["dsc1"], device)
-            output = model(None, None, dsc0_pre=dsc0, dsc1_pre=dsc1)
+            output = unwrapped(None, None, dsc0_pre=dsc0, dsc1_pre=dsc1)
         else:
             img0   = batch["img0"].to(device)
             img1   = batch["img1"].to(device)
             masks0 = pad_masks_to_batch(batch["masks0"], device)
             masks1 = pad_masks_to_batch(batch["masks1"], device)
-            output = model(img0, img1, masks0, masks1)
+            output = unwrapped(img0, img1, masks0, masks1)
 
         loss = loss_fn(output, batch["seg_corr"], batch["masks0"], batch["masks1"])
         m    = metrics_fn(output, batch["seg_corr"], batch["masks0"], batch["masks1"])
@@ -141,7 +160,7 @@ def run_validation(model, loader_val, device, accelerator,
             if "img0" in batch:
                 img0_vis = batch["img0"][b]
                 img1_vis = batch["img1"][b]
-            elif "img_path_i" in batch:
+            elif "img_path_i" in batch and batch["img_path_i"][b]:
                 # Precomputed mode: lazy-load images only for visualization.
                 from training.data.dataset import _load_image
                 from pathlib import Path as _Path
@@ -155,11 +174,34 @@ def run_validation(model, loader_val, device, accelerator,
             if img0_vis is not None:
                 M_b = batch["masks0"][b].shape[0]
                 N_b = batch["masks1"][b].shape[0]
+
+                # In precomputed mode masks are dummy (M,1,1) stubs.
+                # Lazy-load full masks only for the few vis batches.
+                if "mask_path_i" in batch and batch["mask_path_i"][b]:
+                    from training.data.dataset import (
+                        _decode_rles_batched, _resize_masks, MAX_MASKS,
+                    )
+                    import pickle as _pkl
+                    with open(batch["mask_path_i"][b], "rb") as _f:
+                        _rles0 = _pkl.load(_f)["mask_coco_rles_resized"]
+                    with open(batch["mask_path_j"][b], "rb") as _f:
+                        _rles1 = _pkl.load(_f)["mask_coco_rles_resized"]
+                    _H, _W = img0_vis.shape[-2:]
+                    masks0_vis = _decode_rles_batched(_rles0[:MAX_MASKS])
+                    if masks0_vis.shape[-2:] != (_H, _W):
+                        masks0_vis = _resize_masks(masks0_vis, (_H, _W))
+                    masks1_vis = _decode_rles_batched(_rles1[:MAX_MASKS])
+                    if masks1_vis.shape[-2:] != (_H, _W):
+                        masks1_vis = _resize_masks(masks1_vis, (_H, _W))
+                else:
+                    masks0_vis = batch["masks0"][b]
+                    masks1_vis = batch["masks1"][b]
+
                 vis = make_match_vis(
                     img0=img0_vis,
                     img1=img1_vis,
-                    masks0=batch["masks0"][b],
-                    masks1=batch["masks1"][b],
+                    masks0=masks0_vis,
+                    masks1=masks1_vis,
                     log_P=score_mat_fn(output, b, M_b, N_b),
                     seg_corr=batch["seg_corr"][b],
                     max_show=8,
