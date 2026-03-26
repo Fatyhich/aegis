@@ -33,6 +33,7 @@
 - RGB-only processing (no depth required) via VLMs
 - SegMASt3R training: frozen MASt3R backbone + Sinkhorn OT matcher
 - Two model variants: Sinkhorn (`training/models/sinkhorn.py`) and LightGlue (`training/models/lightglue.py`)
+- VGGT backbone variant: frozen VGGT Aggregator + LightGlue head (`training/models/vggt_lightglue.py`)
 - MAX_MASKS = 100 (paper M=100)
 
 ## Training Pipeline — Critical Design Constraint
@@ -43,6 +44,18 @@ DEPEND on which img1 it's paired with. Consequences:
 - Precompute output: `<pair_dsc_root>/<scene>/<name_i>__<name_j>.pt` → `{"dsc0": (M,24), "dsc1": (N,24)}`
 - Config key: `DATASET.PAIR_DSC_ROOT` (old `PRECOMPUTED_FEAT_ROOT` is deprecated/removed)
 - Precomputed mode only supported for LightGlue arch (sinkhorn uses online backbone)
+
+## VGGT Backbone
+- Submodule at `third_party/vggt/` — call `setup_vggt_path()` before any `vggt.*` imports
+- Image normalization: [0, 1] range (Aggregator normalizes internally with ResNet mean/std)
+  — MASt3R uses [-1, 1]. Do NOT mix normalization conventions.
+- Descriptor dim: 2048 (concatenated frame+global tokens) vs MASt3R 24-dim
+- `MODEL.ARCH = "vggt"` requires `DATASET.PAIR_DSC_ROOT` (online too expensive)
+- Precompute script: `training/scripts/precompute_vggt_features.py`
+- Disk warning: VGGT precomputed descriptors are ~85× larger than MASt3R — store as fp16
+  (~6GB per 1K pairs vs ~70MB for MASt3R)
+- Config: `training/config/segvggt_train.yaml`
+- Weights: `third_party/vggt_weights.pt` (local) or `facebook/VGGT-1B` (HuggingFace)
 
 ## Experiment Tracking
 - All runs logged to TensorBoard
