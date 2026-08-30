@@ -65,9 +65,33 @@ DEPEND on which img1 it's paired with. Consequences:
 - Local results: results/segmast3r_repro/
 
 ## Known Issues (evaluation/)
-- `evaluation/core/model_infer.py:65` — `if dataset_type == "mapfree" or "hm3d"` always True
+- `evaluation/core/model_infer.py:97` — `if dataset_type == "mapfree" or "hm3d"` always True
+  (was documented as :65; HM3D is never used as a matching benchmark, only for navigation)
 - `evaluation/datasets/replica_dataset.py:19` — bare import `from ground_truth_generator` fails
 - `evaluation/scripts/eval_vizenc_vkitti2.py:454` — `Image.fromarray` on int32 crashes
+
+## Downstream: closed-loop HM3D navigation (paper Table 3)
+Working tree: `third_party/object-rel-nav/` (oravus/object-rel-nav @6da34c3). Runs with
+`conda activate nav` (miniforge3/envs/nav, habitat_sim 0.3.3 headless, py3.10).
+Entry point `python main.py -c configs/<name>.yaml`; matchers plug in via
+`goal_gen.matcher_name` → `libs/localizer/loc_topo.py` dispatch → adapters in
+`libs/matcher/seg*.py`. Reference adapter: `libs/matcher/segvggt_dpt.py:179-238`.
+
+- Maps for all 108 `data/hm3d_iin_val/` episodes are prebuilt (downloaded, not built here);
+  `hm3d_iin_minival/` is 12 symlinks into it. Scene .glb assets exist for 4 scenes only.
+- Do NOT run `scripts/create_maps_hm3d.py` against `data/hm3d_iin_val/` — it writes graphs
+  under a different filename than the runtime reads and would recompute/overwrite all 108.
+- The pipeline is NOT deterministic: repeated identical runs diverge and can flip an
+  episode's outcome. Report run-to-run variance, never claim zero.
+- `evaluate_objecreact.py` now reads `episode_blacklists` from each run's own `args.yaml`;
+  all run configs declare the upstream `defaults.yaml` list explicitly so the denominator
+  is fixed by the run, not by the evaluator.
+- Per-episode metrics (SPL/soft-SPL) are persisted to `per_episode_metrics.csv` next to each
+  run's results. Statistics: `scripts/analyze_table3.py` (paired McNemar + paired bootstrap).
+- `goal_gen.init_localization` controls cold start: `global` (default, matches frame 0
+  against the whole map), `pose` (seeds from GT start pose), `zero` (legacy, buggy —
+  the localizer window starts at index 0 while `max_start_distance: hard` drops the agent
+  mid-trajectory, so the start can fall outside the search window).
 
 ## After Every Change
 1. Review diff for style compliance (ruff)
