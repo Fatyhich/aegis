@@ -32,6 +32,9 @@ env/
 .env.test
 .env.production
 
+# Claude Code local settings
+.claude/settings.local.json
+
 # Virtualenvwrapper
 .python-version
 .venv-*
@@ -78,8 +81,8 @@ profile_default/
 ipython_config.py
 
 # Данные и большие файлы
-*.csv
-*.tsv
+# *.csv  -- removed: swallowed per_episode_metrics.csv (Table 3 statistics)
+# *.tsv  -- removed with *.csv
 *.parquet
 *.feather
 *.h5
@@ -115,3 +118,21 @@ site/
 .dmypy.json
 dmypy.json
 .pyright/
+
+# ---- Large artifacts that must never be committed (audit 2026-10-03) ----
+# Model weights and backbone checkpoints
+*.pt
+*.pth
+*.ckpt
+!third_party/segmast3r_patches/**
+# Dataset archives
+*.tar
+*.tar.gz
+*.tar.zst
+*.zip
+# Third-party working clones (populated by setup_third_party.sh, not by git)
+/third_party/concept-graphs/
+/third_party/habitat-sim/
+/third_party/object-rel-nav/
+# Claude Code per-project state
+.claude/projects/

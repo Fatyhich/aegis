@@ -42,7 +42,6 @@ name = "aegis"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "accelerate" },
     { name = "einops" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -54,7 +53,6 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "scipy" },
     { name = "seaborn" },
-    { name = "tensorboard" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
@@ -81,7 +79,6 @@ viz = [
 
 [package.metadata]
 requires-dist = [
-    { name = "accelerate", specifier = ">=1.13.0" },
     { name = "accelerate", marker = "extra == 'training'", specifier = ">=1.0" },
     { name = "einops", specifier = ">=0.8" },
     { name = "gradio", marker = "extra == 'viz'", specifier = ">=6.5" },
@@ -99,7 +96,6 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.8" },
     { name = "scipy", specifier = ">=1.15" },
     { name = "seaborn", specifier = ">=0.13.2" },
-    { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "tensorboard", marker = "extra == 'training'", specifier = ">=2.18" },
     { name = "torch", specifier = ">=2.4", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", specifier = ">=0.19", index = "https://download.pytorch.org/whl/cu128" },

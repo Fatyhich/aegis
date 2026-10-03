@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 import torch
+torch.set_float32_matmul_precision("high")  # TF32 on Ampere+: ~1.8x faster matmul
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
@@ -49,6 +50,23 @@ def train_step(model, batch, device, loss_fn):
     loss = loss_fn(output, batch["seg_corr"], batch["masks0"], batch["masks1"])
     # output[0]  = score matrix (log_P for sinkhorn, log_mutual for LG)
     # output[-2] = dsc0,  output[-1] = dsc1
+    return loss, output
+
+
+def train_step_multiframe(model, batch, device, loss_fn):
+    """Train step for multi-frame SegVGGT (N-frame tuples)."""
+    images = batch["images"].to(device)  # (B, N, 3, H, W)
+    pair_indices = batch["pair_indices"]  # list of (a, b)
+
+    # Pad masks per view: list[N] of (B, M_max_v, H, W)
+    B, N = images.shape[:2]
+    masks_padded = []
+    for v in range(N):
+        v_masks = [batch["masks_list"][b][v] for b in range(B)]
+        masks_padded.append(pad_masks_to_batch(v_masks, device))
+
+    output = model.forward_multiframe(images, masks_padded, pair_indices)
+    loss = loss_fn(output, batch["pair_corrs"], batch["masks_list"])
     return loss, output
 
 
@@ -473,6 +491,210 @@ def train(cfg, mock=False, resume=None):
             def score_mat(output, b, M, N):
                 return output[0][b, :M, :N].cpu()
 
+    elif arch == "vggt_dpt_multiframe":
+        from training.models.vggt_dpt_lg import (
+            SegVGGTDPT,
+            lightglue_loss as _lg_loss,
+            multiframe_lightglue_loss,
+            compute_matching_metrics_lg,
+        )
+        lg = cfg.MODEL.LG
+        lg_v2 = cfg.MODEL.LG_V2
+        layer_indices = tuple(getattr(cfg.MODEL, "VGGT_LAYER_INDICES", (5, 11, 17, 23)))
+        fusion_dim = getattr(cfg.MODEL, "VGGT_FUSION_DIM", 256)
+        model = SegVGGTDPT(
+            vggt_ckpt=cfg.MODEL.VGGT_CKPT,
+            layer_indices=layer_indices,
+            fusion_dim=fusion_dim,
+            proj_dim=lg.PROJ_DIM,
+            n_layers=lg.N_LAYERS,
+            n_heads=lg.N_HEADS,
+            ffn_expansion=lg_v2.FFN_EXPANSION,
+            use_grad_checkpoint=lg.GRAD_CHECKPOINT,
+            deep_supervision=False,
+            matchability_bias=getattr(cfg.MODEL, "MATCHABILITY_BIAS", 0.0),
+            temperature_init=getattr(cfg.MODEL, "TEMPERATURE_INIT", 1.0),
+            device="cpu",
+        )
+        _lambda = lg.LAMBDA_MATCH
+        _n_frames = getattr(cfg.DATASET, "N_FRAMES", 4)
+        if accelerator.is_main_process:
+            print(f"SegVGGT-DPT-Multiframe: N={_n_frames}, "
+                  f"layers={list(layer_indices)}, "
+                  f"fusion_dim={fusion_dim}, proj_dim={lg.PROJ_DIM}")
+
+        # Training loss: multiframe (3-arg signature for train_step_multiframe)
+        def loss_fn_train(output, pair_corrs_batch, masks_batch):
+            return multiframe_lightglue_loss(
+                output, pair_corrs_batch, masks_batch,
+                lambda_match=_lambda,
+            )
+        # Validation uses pairwise forward() → standard 4-arg signature
+        def loss_fn(output, seg_corr, masks0, masks1):
+            return _lg_loss(output[0], output[1], output[2],
+                            seg_corr, masks0, masks1, lambda_match=_lambda)
+        def metrics_fn(output, seg_corr, masks0, masks1):
+            return compute_matching_metrics_lg(output[0], output[1],
+                                               seg_corr, masks0, masks1)
+        def score_mat(output, b, M, N):
+            return output[0][b, :M, :N].cpu()
+
+        # Override only the training dataset to use tuples;
+        # validation stays pairwise (run_validation expects pairwise batches).
+        # Reuse ds_full (pairwise, already created above) to avoid re-filtering
+        # 3.5M pairs a second time. Build tuple dataset from same filtered pairs.
+        if not mock:
+            from training.data.dataset import (
+                ScanNetPPTupleDataset, collate_fn_tuple,
+            )
+            # Wrap existing pairwise dataset into a tuple dataset
+            # (shares metadata, pairs, img_cache — no re-filtering)
+            ds_tuple = ScanNetPPTupleDataset.from_pairwise(
+                ds_full,
+                n_frames=_n_frames,
+                min_pairs_per_tuple=getattr(cfg.DATASET, "MIN_PAIRS_PER_TUPLE", 2),
+                max_pairs_per_tuple=getattr(cfg.DATASET, "MAX_PAIRS_PER_TUPLE", 6),
+                random_neighbor_prob=getattr(cfg.DATASET, "RANDOM_NEIGHBOR_PROB", 0.2),
+            )
+            # ds_full and ds_tuple share the same pairs list / length
+            # → reuse the indices already computed for ds_full
+            n_total = len(ds_full)
+            max_pairs = getattr(cfg.DATASET, "MAX_PAIRS", 0)
+            if max_pairs > 0 and max_pairs < n_total:
+                if accelerator.is_main_process:
+                    print(f"MAX_PAIRS={max_pairs:,} — subsampling from {n_total:,}")
+                n_total = max_pairs
+            n_val = max(1, int(n_total * cfg.DATASET.VAL_FRACTION))
+            indices = torch.randperm(len(ds_full), generator=torch.Generator().manual_seed(42))
+            indices = indices[:n_total]
+
+            ds_train = Subset(ds_tuple, indices[n_val:].tolist())
+            ds_val   = Subset(ds_full,  indices[:n_val].tolist())
+
+            if accelerator.is_main_process:
+                print(f"Train (tuples): {len(ds_train):,}  |  "
+                      f"Val (pairwise): {len(ds_val):,}")
+
+            # Rebuild training loader with tuple collate
+            loader_train = DataLoader(
+                ds_train,
+                batch_size=cfg.TRAINING.BATCH_SIZE,
+                shuffle=True,
+                num_workers=cfg.TRAINING.NUM_WORKERS,
+                collate_fn=collate_fn_tuple,
+                pin_memory=(accelerator.device.type == "cuda"),
+                prefetch_factor=cfg.TRAINING.PREFETCH_FACTOR,
+                persistent_workers=(cfg.TRAINING.NUM_WORKERS > 0),
+            )
+            # Val loader stays pairwise (reuses collate_fn from original setup)
+            loader_val = DataLoader(
+                ds_val,
+                batch_size=cfg.TRAINING.BATCH_SIZE,
+                shuffle=False,
+                num_workers=min(4, cfg.TRAINING.NUM_WORKERS),
+                collate_fn=collate_fn,
+                pin_memory=(accelerator.device.type == "cuda"),
+            )
+
+    elif arch == "vggt_dpt_joint":
+        from training.models.vggt_dpt_lg import (
+            SegVGGTDPTJoint,
+            lightglue_loss as _lg_loss,
+            multiframe_lightglue_loss,
+            compute_matching_metrics_lg,
+        )
+        lg = cfg.MODEL.LG
+        lg_v2 = cfg.MODEL.LG_V2
+        layer_indices = tuple(getattr(cfg.MODEL, "VGGT_LAYER_INDICES", (5, 11, 17, 23)))
+        fusion_dim = getattr(cfg.MODEL, "VGGT_FUSION_DIM", 256)
+        _n_joint_layers = getattr(cfg.MODEL, "N_JOINT_LAYERS", 3)
+        _max_frames = getattr(cfg.MODEL, "MAX_FRAMES", 16)
+        model = SegVGGTDPTJoint(
+            vggt_ckpt=cfg.MODEL.VGGT_CKPT,
+            layer_indices=layer_indices,
+            fusion_dim=fusion_dim,
+            proj_dim=lg.PROJ_DIM,
+            n_joint_layers=_n_joint_layers,
+            n_heads=lg.N_HEADS,
+            ffn_expansion=lg_v2.FFN_EXPANSION,
+            max_frames=_max_frames,
+            use_grad_checkpoint=lg.GRAD_CHECKPOINT,
+            matchability_bias=getattr(cfg.MODEL, "MATCHABILITY_BIAS", 0.0),
+            temperature_init=getattr(cfg.MODEL, "TEMPERATURE_INIT", 1.0),
+            device="cpu",
+        )
+        _lambda = lg.LAMBDA_MATCH
+        _n_frames = getattr(cfg.DATASET, "N_FRAMES", 4)
+        if accelerator.is_main_process:
+            print(f"SegVGGT-DPT-Joint: N={_n_frames}, "
+                  f"joint_layers={_n_joint_layers}, max_frames={_max_frames}, "
+                  f"layers={list(layer_indices)}, "
+                  f"fusion_dim={fusion_dim}, proj_dim={lg.PROJ_DIM}")
+
+        # Training loss: multiframe (3-arg signature for train_step_multiframe)
+        def loss_fn_train(output, pair_corrs_batch, masks_batch):
+            return multiframe_lightglue_loss(
+                output, pair_corrs_batch, masks_batch,
+                lambda_match=_lambda,
+            )
+        # Validation uses pairwise forward() → standard 4-arg signature
+        def loss_fn(output, seg_corr, masks0, masks1):
+            return _lg_loss(output[0], output[1], output[2],
+                            seg_corr, masks0, masks1, lambda_match=_lambda)
+        def metrics_fn(output, seg_corr, masks0, masks1):
+            return compute_matching_metrics_lg(output[0], output[1],
+                                               seg_corr, masks0, masks1)
+        def score_mat(output, b, M, N):
+            return output[0][b, :M, :N].cpu()
+
+        # Dataset: same tuple train / pairwise val as multiframe
+        if not mock:
+            from training.data.dataset import (
+                ScanNetPPTupleDataset, collate_fn_tuple,
+            )
+            ds_tuple = ScanNetPPTupleDataset.from_pairwise(
+                ds_full,
+                n_frames=_n_frames,
+                min_pairs_per_tuple=getattr(cfg.DATASET, "MIN_PAIRS_PER_TUPLE", 2),
+                max_pairs_per_tuple=getattr(cfg.DATASET, "MAX_PAIRS_PER_TUPLE", 6),
+                random_neighbor_prob=getattr(cfg.DATASET, "RANDOM_NEIGHBOR_PROB", 0.2),
+            )
+            n_total = len(ds_full)
+            max_pairs = getattr(cfg.DATASET, "MAX_PAIRS", 0)
+            if max_pairs > 0 and max_pairs < n_total:
+                if accelerator.is_main_process:
+                    print(f"MAX_PAIRS={max_pairs:,} — subsampling from {n_total:,}")
+                n_total = max_pairs
+            n_val = max(1, int(n_total * cfg.DATASET.VAL_FRACTION))
+            indices = torch.randperm(len(ds_full), generator=torch.Generator().manual_seed(42))
+            indices = indices[:n_total]
+
+            ds_train = Subset(ds_tuple, indices[n_val:].tolist())
+            ds_val   = Subset(ds_full,  indices[:n_val].tolist())
+
+            if accelerator.is_main_process:
+                print(f"Train (tuples): {len(ds_train):,}  |  "
+                      f"Val (pairwise): {len(ds_val):,}")
+
+            loader_train = DataLoader(
+                ds_train,
+                batch_size=cfg.TRAINING.BATCH_SIZE,
+                shuffle=True,
+                num_workers=cfg.TRAINING.NUM_WORKERS,
+                collate_fn=collate_fn_tuple,
+                pin_memory=(accelerator.device.type == "cuda"),
+                prefetch_factor=cfg.TRAINING.PREFETCH_FACTOR,
+                persistent_workers=(cfg.TRAINING.NUM_WORKERS > 0),
+            )
+            loader_val = DataLoader(
+                ds_val,
+                batch_size=cfg.TRAINING.BATCH_SIZE,
+                shuffle=False,
+                num_workers=min(4, cfg.TRAINING.NUM_WORKERS),
+                collate_fn=collate_fn,
+                pin_memory=(accelerator.device.type == "cuda"),
+            )
+
     else:  # sinkhorn (default)
         from training.models.sinkhorn import SegMASt3R, superglue_nll_loss as _nll
         model = SegMASt3R(
@@ -556,7 +778,10 @@ def train(cfg, mock=False, resume=None):
                 _t_after_data = time.time()
 
             optimizer.zero_grad()
-            loss, output = train_step(model, batch, device, loss_fn)
+            if arch in ("vggt_dpt_multiframe", "vggt_dpt_joint"):
+                loss, output = train_step_multiframe(model, batch, device, loss_fn_train)
+            else:
+                loss, output = train_step(model, batch, device, loss_fn)
 
             if _debug:
                 _sync()

@@ -284,6 +284,102 @@ class SegmentAttentionLayerV2(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Joint multi-frame segment attention
+# ---------------------------------------------------------------------------
+
+class JointSegmentAttention(nn.Module):
+    """
+    Self-attention over concatenated segment descriptors from all N frames.
+
+    Mirrors VGGT Aggregator's global attention pattern at the segment level:
+    all segments from all frames attend to each other in a single pass,
+    enabling transitive matching (A↔C through shared context with B).
+
+    Learnable frame embeddings let the model distinguish which frame each
+    segment belongs to (up to max_frames).
+    """
+
+    def __init__(
+        self,
+        dim: int = 128,
+        num_heads: int = 4,
+        ffn_expansion: int = 4,
+        max_frames: int = 16,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.heads = num_heads
+        self.head_dim = dim // num_heads
+
+        # Learnable frame position embeddings
+        self.frame_embed = nn.Embedding(max_frames, dim)
+
+        # Self-attention (Pre-LN)
+        self.norm = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+        # Feed-forward (Pre-LN)
+        ffn_dim = dim * ffn_expansion
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(),
+            nn.Linear(ffn_dim, dim),
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+
+    def forward(
+        self,
+        segments: list[Tensor],
+        frame_embeds_added: bool = False,
+    ) -> list[Tensor]:
+        """
+        Args:
+            segments: list of N tensors, each (B, M_k, D).
+            frame_embeds_added: if True, skip adding frame embeddings
+                (caller already added them before the first layer).
+        Returns:
+            list of N tensors (B, M_k, D), same shapes as input.
+        """
+        B = segments[0].shape[0]
+        N = len(segments)
+
+        # Record split sizes and concatenate
+        sizes = [s.shape[1] for s in segments]
+
+        if not frame_embeds_added:
+            # Add frame embeddings only on first layer call
+            parts = [s + self.frame_embed.weight[v] for v, s in enumerate(segments)]
+            x = torch.cat(parts, dim=1)
+        else:
+            x = torch.cat(segments, dim=1)
+
+        L = x.shape[1]
+
+        # Self-attention
+        normed = self.norm(x)
+        qkv = self.qkv(normed)
+        Q, K, V = qkv.chunk(3, dim=-1)
+        Q = Q.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, L, self.heads, self.head_dim).transpose(1, 2)
+        attn_out = F.scaled_dot_product_attention(Q, K, V)
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, self.dim)
+        x = x + self.out_proj(attn_out)
+
+        # FFN
+        x = x + self.ffn(x)
+
+        # Split back into per-frame tensors
+        return list(x.split(sizes, dim=1))
+
+
+# ---------------------------------------------------------------------------
 # DoubleSoftmax Matcher — inline implementation
 # ---------------------------------------------------------------------------
 
@@ -502,6 +598,114 @@ class SegVGGTDPT(nn.Module):
 
         return feats_0, feats_1, H_p, W_p
 
+    # ------------------------------------------------------------------
+    # Multi-frame extraction (variable N)
+    # ------------------------------------------------------------------
+
+    def extract_multi_layer_nframes(
+        self, images: Tensor,
+    ) -> tuple[list[list[Tensor]], int, int]:
+        """
+        Extract dense patch features from multiple Aggregator layers for N frames.
+
+        Args:
+            images: (B, N, 3, H, W) in [-1, 1] range (dataset convention).
+        Returns:
+            all_feats: list of N items, each a list of len(layer_indices) tensors
+                       (B, 2048, H_p, W_p), ordered deep → shallow.
+            H_p: patch grid height
+            W_p: patch grid width
+        """
+        B, N = images.shape[:2]
+
+        # [-1, 1] → [0, 1]
+        images = (images + 1.0) * 0.5
+
+        # Resize to nearest multiple of patch_size=14
+        H, W = images.shape[-2:]
+        H_new = round(H / 14) * 14
+        W_new = round(W / 14) * 14
+        if (H_new, W_new) != (H, W):
+            images = images.view(B * N, 3, H, W)
+            images = F.interpolate(
+                images, (H_new, W_new), mode="bilinear", align_corners=False
+            )
+            images = images.view(B, N, 3, H_new, W_new)
+        H_p, W_p = H_new // 14, W_new // 14
+
+        with torch.no_grad():
+            aggregated_tokens_list, ps_idx = self.aggregator(images)
+
+        # all_feats[v] = list of layer features for view v
+        all_feats = [[] for _ in range(N)]
+        for layer_idx in self.layer_indices:  # deep → shallow
+            tokens = aggregated_tokens_list[layer_idx]  # (B, N, P, 2048)
+            patch_tokens = tokens[:, :, ps_idx:]
+            patch_tokens = patch_tokens[:, :, :H_p * W_p]
+            patch_tokens = patch_tokens.view(B, N, H_p, W_p, self.AGG_DIM)
+            patch_tokens = patch_tokens.permute(0, 1, 4, 2, 3)  # (B, N, 2048, H_p, W_p)
+            for v in range(N):
+                all_feats[v].append(patch_tokens[:, v].contiguous())
+
+        return all_feats, H_p, W_p
+
+    def forward_multiframe(
+        self,
+        images: Tensor,
+        masks_list: list[Tensor],
+        pair_indices: list[tuple[int, int]],
+    ) -> dict[tuple[int, int], tuple[Tensor, Tensor, Tensor]]:
+        """
+        Multi-frame forward: N frames through backbone, pairwise matching head.
+
+        Args:
+            images: (B, N, 3, H, W) in [-1, 1] range.
+            masks_list: list of N tensors, each (B, M_k, H, W).
+            pair_indices: list of (a, b) frame-index pairs to match.
+        Returns:
+            dict mapping (a, b) → (log_mutual, match0, match1)
+        """
+        B, N = images.shape[:2]
+
+        # 1. Extract multi-layer features for all N frames
+        all_feats, H_p, W_p = self.extract_multi_layer_nframes(images)
+
+        # 2. DPT fusion per view (shared weights)
+        fused = [self.fusion(all_feats[v]) for v in range(N)]
+
+        # 3. Masked pooling + projection per view
+        proj_dtype = next(self.proj.parameters()).dtype
+        projs = []
+        for v in range(N):
+            m = masks_list[v]
+            if m.shape[-2:] != (H_p, W_p):
+                m = F.interpolate(m.float(), (H_p, W_p), mode="nearest")
+            dsc = masked_average_pooling(fused[v], m.float())  # (B, fusion_dim, M_k)
+            proj = self.proj(dsc.transpose(1, 2).to(dtype=proj_dtype))  # (B, M_k, proj_dim)
+            projs.append(proj)
+
+        # 4. Pairwise matching for each requested pair
+        results = {}
+        for (a, b) in pair_indices:
+            x0, x1 = projs[a].clone(), projs[b].clone()
+
+            for layer in self.attn_layers:
+                if self.use_grad_checkpoint and self.training:
+                    x0, x1 = checkpoint(layer, x0, x1, use_reentrant=False)
+                else:
+                    x0, x1 = layer(x0, x1)
+
+            log_mutual, m0, m1 = self.matcher(
+                x0.transpose(1, 2), x1.transpose(1, 2)
+            )
+            results[(a, b)] = (log_mutual, m0, m1)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Original pairwise forward (backward compatible)
+    # ------------------------------------------------------------------
+
     def forward(
         self,
         img0: Tensor, img1: Tensor,
@@ -567,6 +771,125 @@ class SegVGGTDPT(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Joint multi-frame variant (separate arch: vggt_dpt_joint)
+# ---------------------------------------------------------------------------
+
+class SegVGGTDPTJoint(SegVGGTDPT):
+    """
+    SegVGGT-DPT with joint multi-frame segment attention.
+
+    Replaces per-pair attention refinement with a single self-attention pass
+    over all segments from all N frames.  Pairwise scores are extracted
+    afterwards via DoubleSoftmaxMatcher.
+
+    Inherits backbone, fusion, projector, and matcher from SegVGGTDPT.
+    Adds joint_attn_layers (JointSegmentAttention) as the only trainable
+    attention component — attn_layers (pairwise) are not used.
+    """
+
+    def __init__(
+        self,
+        vggt_ckpt: str,
+        layer_indices: tuple[int, ...] = (5, 11, 17, 23),
+        fusion_dim: int = 256,
+        proj_dim: int = 128,
+        n_joint_layers: int = 3,
+        n_heads: int = 4,
+        ffn_expansion: int = 4,
+        max_frames: int = 16,
+        use_grad_checkpoint: bool = False,
+        matchability_bias: float = 0.0,
+        temperature_init: float = 1.0,
+        device: str = "cpu",
+    ):
+        # Parent creates aggregator, fusion, proj, matcher.
+        # n_layers=0 → empty attn_layers (not used in joint mode).
+        super().__init__(
+            vggt_ckpt=vggt_ckpt,
+            layer_indices=layer_indices,
+            fusion_dim=fusion_dim,
+            proj_dim=proj_dim,
+            n_layers=0,
+            n_heads=n_heads,
+            ffn_expansion=ffn_expansion,
+            use_grad_checkpoint=use_grad_checkpoint,
+            deep_supervision=False,
+            matchability_bias=matchability_bias,
+            temperature_init=temperature_init,
+            device=device,
+        )
+
+        self.joint_attn_layers = nn.ModuleList([
+            JointSegmentAttention(
+                dim=proj_dim, num_heads=n_heads,
+                ffn_expansion=ffn_expansion, max_frames=max_frames,
+            )
+            for _ in range(n_joint_layers)
+        ])
+
+    def forward_multiframe(
+        self,
+        images: Tensor,
+        masks_list: list[Tensor],
+        pair_indices: list[tuple[int, int]],
+    ) -> dict[tuple[int, int], tuple[Tensor, Tensor, Tensor]]:
+        """
+        Joint multi-frame forward.
+
+        Pipeline:
+          1. Frozen VGGT Aggregator → multi-layer features for N frames
+          2. DPT fusion per view → spatial feature maps
+          3. Masked pooling + projection → per-segment descriptors
+          4. Joint self-attention over ALL segments from ALL frames (one pass)
+          5. DoubleSoftmax pairwise scoring for requested pairs
+
+        Args:
+            images: (B, N, 3, H, W) in [-1, 1] range.
+            masks_list: list of N tensors, each (B, M_k, H, W).
+            pair_indices: list of (a, b) frame-index pairs to match.
+        Returns:
+            dict mapping (a, b) → (log_mutual, match0, match1)
+        """
+        B, N = images.shape[:2]
+
+        # 1. Extract multi-layer features for all N frames
+        all_feats, H_p, W_p = self.extract_multi_layer_nframes(images)
+
+        # 2. DPT fusion per view (shared weights)
+        fused = [self.fusion(all_feats[v]) for v in range(N)]
+
+        # 3. Masked pooling + projection per view
+        proj_dtype = next(self.proj.parameters()).dtype
+        projs = []
+        for v in range(N):
+            m = masks_list[v]
+            if m.shape[-2:] != (H_p, W_p):
+                m = F.interpolate(m.float(), (H_p, W_p), mode="nearest")
+            dsc = masked_average_pooling(fused[v], m.float())
+            proj = self.proj(dsc.transpose(1, 2).to(dtype=proj_dtype))
+            projs.append(proj)
+
+        # 4. Joint self-attention: all segments attend to all segments
+        for i, layer in enumerate(self.joint_attn_layers):
+            # Frame embeddings added only on first layer
+            skip_embed = (i > 0)
+            if self.use_grad_checkpoint and self.training:
+                projs = checkpoint(layer, projs, skip_embed, use_reentrant=False)
+            else:
+                projs = layer(projs, frame_embeds_added=skip_embed)
+
+        # 5. Pairwise scoring from joint representations
+        results = {}
+        for (a, b) in pair_indices:
+            log_mutual, m0, m1 = self.matcher(
+                projs[a].transpose(1, 2), projs[b].transpose(1, 2)
+            )
+            results[(a, b)] = (log_mutual, m0, m1)
+
+        return results
+
+
+# ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
@@ -615,6 +938,94 @@ def lightglue_loss(
         bce1 = F.binary_cross_entropy_with_logits(m1, gt1)
 
         total = total + match_loss + lambda_match * (bce0 + bce1)
+
+    return total / B
+
+
+def _lightglue_loss_single(
+    lm: Tensor, m0: Tensor, m1: Tensor,
+    corr: Tensor, M: int, N: int,
+    lambda_match: float = 1.0,
+) -> Tensor:
+    """
+    Single-sample lightglue loss (no batch dim).
+
+    Args:
+        lm: (M_pad, N_pad) log mutual agreement scores
+        m0: (M_pad,) matchability logits
+        m1: (N_pad,) matchability logits
+        corr: (K, 2) GT correspondences
+        M: actual number of segments in view 0
+        N: actual number of segments in view 1
+        lambda_match: BCE weight
+    """
+    lm = lm[:M, :N]
+    m0 = m0[:M]
+    m1 = m1[:N]
+
+    gt0 = torch.zeros(M, device=lm.device)
+    gt1 = torch.zeros(N, device=lm.device)
+
+    match_loss = lm.new_zeros(1)
+
+    if corr.shape[0] > 0:
+        corr = corr.to(lm.device)
+        valid = (corr[:, 0] < M) & (corr[:, 1] < N)
+        corr_v = corr[valid]
+        if corr_v.shape[0] > 0:
+            i_idx = corr_v[:, 0]
+            j_idx = corr_v[:, 1]
+            match_loss = -lm[i_idx, j_idx].mean()
+            gt0[i_idx] = 1.0
+            gt1[j_idx] = 1.0
+
+    bce0 = F.binary_cross_entropy_with_logits(m0, gt0)
+    bce1 = F.binary_cross_entropy_with_logits(m1, gt1)
+
+    return match_loss + lambda_match * (bce0 + bce1)
+
+
+def multiframe_lightglue_loss(
+    pair_results: dict[tuple[int, int], tuple[Tensor, Tensor, Tensor]],
+    pair_corrs_batch: list[dict],
+    masks_batch: list[list[Tensor]],
+    lambda_match: float = 1.0,
+) -> Tensor:
+    """
+    Multi-frame loss with per-tuple normalization.
+
+    Each batch sample (tuple) contributes equally to the loss,
+    regardless of how many GT pairs it has.
+
+    Args:
+        pair_results: {(a,b): (log_mutual, match0, match1)} from forward_multiframe
+        pair_corrs_batch: list[B] of dicts {(a,b): corr_tensor}
+        masks_batch: list[B] of list[N] of mask tensors
+        lambda_match: BCE weight
+    """
+    B = len(pair_corrs_batch)
+    # Get device from first result tensor
+    device = next(iter(pair_results.values()))[0].device
+    total = torch.zeros(1, device=device)
+
+    for b in range(B):
+        tuple_loss = torch.zeros(1, device=device)
+        n_pairs_b = 0
+
+        for (a, ab_b), (lm, m0, m1) in pair_results.items():
+            corr = pair_corrs_batch[b].get((a, ab_b))
+            if corr is None:
+                continue
+
+            M = masks_batch[b][a].shape[0]
+            N = masks_batch[b][ab_b].shape[0]
+
+            tuple_loss = tuple_loss + _lightglue_loss_single(
+                lm[b], m0[b], m1[b], corr, M, N, lambda_match
+            )
+            n_pairs_b += 1
+
+        total = total + tuple_loss / max(n_pairs_b, 1)
 
     return total / B
 

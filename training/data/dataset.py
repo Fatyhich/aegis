@@ -20,7 +20,9 @@ Resize modes:
 
 import os
 import pickle
+import random
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Literal
 
@@ -136,6 +138,7 @@ class ScanNetPPSegDataset(Dataset):
         self.resize_mode    = resize_mode
         self._profile       = bool(os.environ.get("PROFILE_DATALOADER"))
 
+        print(f"Loading metadata from {metadata_path}...", flush=True)
         meta = np.load(metadata_path, allow_pickle=True)
         self.scenes       = meta["scenes"]
         self.sceneids     = meta["sceneids"]
@@ -183,13 +186,23 @@ class ScanNetPPSegDataset(Dataset):
 
     def _filter_pairs(self, raw_pairs):
         valid = []
-        for i, j in raw_pairs:
+        total = len(raw_pairs)
+        log_every = max(1, total // 20)  # ~5% increments
+        skipped = 0
+        for k, (i, j) in enumerate(raw_pairs):
             i, j = int(i), int(j)
             if not self._pair_pkl(i, j).exists():
+                skipped += 1
                 continue
             if self.pair_dsc_root and not self._pair_dsc_path(i, j).exists():
+                skipped += 1
                 continue
             valid.append((i, j))
+            if (k + 1) % log_every == 0:
+                pct = (k + 1) / total * 100
+                print(f"  _filter_pairs: {pct:5.1f}% ({k+1:,}/{total:,}) "
+                      f"— {len(valid):,} valid, {skipped:,} skipped",
+                      flush=True)
         return valid
 
     def _build_img_cache(self) -> dict:
@@ -198,9 +211,12 @@ class ScanNetPPSegDataset(Dataset):
             unique_ids.add(i)
             unique_ids.add(j)
 
+        total = len(unique_ids)
+        log_every = max(1, total // 10)
+        print(f"  _build_img_cache: resolving {total:,} unique images...", flush=True)
         cache = {}
         exts = (".jpg", ".JPG", ".jpeg", ".png")
-        for idx in unique_ids:
+        for k, idx in enumerate(unique_ids):
             scene = self.scenes[self.sceneids[idx]]
             name  = self.images[idx]
             base  = self.processed_root / scene / "images" / name
@@ -209,6 +225,9 @@ class ScanNetPPSegDataset(Dataset):
                 if p.exists():
                     cache[idx] = p
                     break
+            if (k + 1) % log_every == 0:
+                print(f"  _build_img_cache: {(k+1)/total*100:5.1f}% "
+                      f"({k+1:,}/{total:,})", flush=True)
         return cache
 
     def _get_img_path(self, idx: int) -> Path:
@@ -390,3 +409,324 @@ def get_collate_fn(resize_mode: ResizeMode):
     if resize_mode == "square":
         return collate_fn_square
     return collate_fn_longest_side
+
+
+# ---------------------------------------------------------------------------
+# Multi-frame tuple dataset
+# ---------------------------------------------------------------------------
+
+class ScanNetPPTupleDataset(ScanNetPPSegDataset):
+    """
+    N-frame tuple dataset for multi-frame SegVGGT training.
+
+    Inherits image/mask loading from ScanNetPPSegDataset but returns
+    N-frame tuples instead of pairs.  GT correspondences are looked up
+    from existing pairwise pickles for all available sub-pairs in each tuple.
+
+    Tuple sampling strategy:
+      1. Pick a seed pair (i, j) from the pair list
+      2. Greedy-expand (with random_neighbor_prob chance of random pick)
+         to N frames, maximizing inter-connectivity in the pair graph
+      3. Shuffle frame order as augmentation (VGGT camera_token[0] bias)
+      4. Return images + masks + pairwise GT for available sub-pairs
+    """
+
+    def __init__(
+        self,
+        metadata_path: str,
+        processed_root: str,
+        masks_root: str,
+        pairs_root: str,
+        target_size: int = 512,
+        max_masks: int = MAX_MASKS,
+        resize_mode: ResizeMode = "square",
+        n_frames: int = 4,
+        min_pairs_per_tuple: int = 2,
+        max_pairs_per_tuple: int = 6,
+        random_neighbor_prob: float = 0.2,
+    ):
+        # Parent builds self.pairs, self.scenes, self.sceneids, self.images, etc.
+        # Force pair_dsc_root="" — multi-frame is online-only.
+        super().__init__(
+            metadata_path=metadata_path,
+            processed_root=processed_root,
+            masks_root=masks_root,
+            pairs_root=pairs_root,
+            target_size=target_size,
+            max_masks=max_masks,
+            resize_mode=resize_mode,
+            pair_dsc_root="",
+        )
+        self.n_frames = n_frames
+        self.min_pairs_per_tuple = min_pairs_per_tuple
+        self.max_pairs_per_tuple = max_pairs_per_tuple
+        self.random_neighbor_prob = random_neighbor_prob
+
+        # Build per-frame adjacency graph from validated pairs
+        self._adj = defaultdict(set)
+        self._pair_set = set()       # bidirectional — for _has_gt() connectivity
+        self._canonical_pairs = set()  # original direction — for pkl path resolution
+        for i, j in self.pairs:
+            self._adj[i].add(j)
+            self._adj[j].add(i)
+            self._pair_set.add((i, j))
+            self._pair_set.add((j, i))
+            self._canonical_pairs.add((i, j))
+
+        print(f"ScanNetPPTupleDataset: n_frames={n_frames}, "
+              f"min_pairs={min_pairs_per_tuple}, max_pairs={max_pairs_per_tuple}, "
+              f"random_neighbor_prob={random_neighbor_prob:.2f}")
+
+    @classmethod
+    def from_pairwise(
+        cls,
+        pairwise_ds: "ScanNetPPSegDataset",
+        n_frames: int = 4,
+        min_pairs_per_tuple: int = 2,
+        max_pairs_per_tuple: int = 6,
+        random_neighbor_prob: float = 0.2,
+    ) -> "ScanNetPPTupleDataset":
+        """
+        Build a tuple dataset by reusing an already-initialized pairwise
+        dataset (shares metadata, filtered pairs, img cache — no re-filtering).
+        """
+        obj = object.__new__(cls)
+        # Copy all parent state
+        obj.processed_root = pairwise_ds.processed_root
+        obj.masks_root = pairwise_ds.masks_root
+        obj.pairs_root = pairwise_ds.pairs_root
+        obj.pair_dsc_root = None
+        obj.target_size = pairwise_ds.target_size
+        obj.max_masks = pairwise_ds.max_masks
+        obj.resize_mode = pairwise_ds.resize_mode
+        obj._profile = False
+        obj.scenes = pairwise_ds.scenes
+        obj.sceneids = pairwise_ds.sceneids
+        obj.images = pairwise_ds.images
+        obj.intrinsics = pairwise_ds.intrinsics
+        obj.trajectories = pairwise_ds.trajectories
+        obj.pairs = pairwise_ds.pairs
+        obj._img_path_cache = pairwise_ds._img_path_cache
+
+        # Tuple-specific state
+        obj.n_frames = n_frames
+        obj.min_pairs_per_tuple = min_pairs_per_tuple
+        obj.max_pairs_per_tuple = max_pairs_per_tuple
+        obj.random_neighbor_prob = random_neighbor_prob
+
+        obj._adj = defaultdict(set)
+        obj._pair_set = set()
+        obj._canonical_pairs = set()
+        for i, j in obj.pairs:
+            obj._adj[i].add(j)
+            obj._adj[j].add(i)
+            obj._pair_set.add((i, j))
+            obj._pair_set.add((j, i))
+            obj._canonical_pairs.add((i, j))
+
+        print(f"ScanNetPPTupleDataset.from_pairwise: n_frames={n_frames}, "
+              f"min_pairs={min_pairs_per_tuple}, max_pairs={max_pairs_per_tuple}, "
+              f"random_neighbor_prob={random_neighbor_prob:.2f} "
+              f"(reusing {len(obj.pairs):,} filtered pairs)")
+        return obj
+
+    # ------------------------------------------------------------------
+    # Tuple construction
+    # ------------------------------------------------------------------
+
+    def _has_gt(self, idx_i: int, idx_j: int) -> bool:
+        """Check if pairwise GT exists (either direction)."""
+        return (idx_i, idx_j) in self._pair_set
+
+    def _expand_to_tuple(self, seed_i: int, seed_j: int) -> list[int]:
+        """
+        Expand a seed pair to an N-frame tuple using greedy connectivity
+        with occasional random picks to avoid hub-node overfitting.
+
+        Returns list of N frame indices, or fewer if expansion fails.
+        """
+        group = [seed_i, seed_j]
+        group_set = {seed_i, seed_j}
+
+        # Candidates: union of neighbors of all frames in group
+        for _ in range(self.n_frames - 2):
+            candidates = set()
+            for g in group:
+                candidates.update(self._adj[g] - group_set)
+            if not candidates:
+                break
+
+            if random.random() < self.random_neighbor_prob:
+                # Random pick (anti-hub augmentation)
+                chosen = random.choice(list(candidates))
+            else:
+                # Greedy: pick candidate with most connections to group
+                best, best_score = None, -1
+                for c in candidates:
+                    score = sum(1 for g in group if self._has_gt(c, g))
+                    if score > best_score:
+                        best, best_score = c, score
+                chosen = best
+
+            group.append(chosen)
+            group_set.add(chosen)
+
+        return group
+
+    def _load_frame(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load image and masks for a single frame index."""
+        img = _load_image(self._get_img_path(idx), self.target_size, self.resize_mode)
+        _, H, W = img.shape
+
+        with open(self._mask_pkl(idx), "rb") as f:
+            rles = pickle.load(f)["mask_coco_rles_resized"]
+
+        if rles:
+            masks = _decode_rles_batched(rles[:self.max_masks])
+            if masks.shape[-2:] != (H, W):
+                masks = _resize_masks(masks, (H, W))
+        else:
+            masks = torch.zeros(0, H, W, dtype=torch.uint8)
+
+        return img, masks.to(torch.uint8)
+
+    def _load_pair_corr(
+        self, idx_i: int, idx_j: int, M_i: int, M_j: int,
+    ) -> torch.Tensor | None:
+        """Load pairwise GT correspondences, or None if not available."""
+        # Resolve canonical order — pkl files are stored as name_i__name_j
+        # where (i,j) matches the original metadata pair direction.
+        swapped = False
+        if (idx_i, idx_j) in self._canonical_pairs:
+            pkl_path = self._pair_pkl(idx_i, idx_j)
+        elif (idx_j, idx_i) in self._canonical_pairs:
+            pkl_path = self._pair_pkl(idx_j, idx_i)
+            swapped = True
+        else:
+            return None
+
+        if not pkl_path.exists():
+            return None
+
+        with open(pkl_path, "rb") as f:
+            seg_corr_raw = pickle.load(f).get("seg_corr_list", [])
+
+        # If we swapped order, flip correspondence columns
+        if swapped:
+            seg_corr_raw = [(j, i) for i, j in seg_corr_raw]
+
+        corr_filtered = [
+            (i, j) for i, j in seg_corr_raw if i < M_i and j < M_j
+        ]
+        if not corr_filtered:
+            return None
+
+        return torch.tensor(corr_filtered, dtype=torch.long)
+
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, idx):
+        # Seed pair
+        seed_i, seed_j = self.pairs[idx]
+
+        # Expand to N-frame tuple (with retries if too few GT pairs)
+        max_retries = 5
+        for attempt in range(max_retries):
+            if attempt == 0:
+                group = self._expand_to_tuple(seed_i, seed_j)
+            else:
+                # Pick a random seed pair for retry
+                ri = random.randint(0, len(self.pairs) - 1)
+                si, sj = self.pairs[ri]
+                group = self._expand_to_tuple(si, sj)
+
+            if len(group) < self.n_frames:
+                continue
+
+            # Shuffle frame order (augmentation against camera_token[0] bias)
+            random.shuffle(group)
+
+            # Load all frames
+            images = []
+            masks_list = []
+            for frame_idx in group:
+                img, masks = self._load_frame(frame_idx)
+                images.append(img)
+                masks_list.append(masks)
+
+            # Collect pairwise GT for all available sub-pairs
+            pair_corrs = {}
+            pair_indices = []
+            for a in range(len(group)):
+                for b in range(a + 1, len(group)):
+                    corr = self._load_pair_corr(
+                        group[a], group[b],
+                        masks_list[a].shape[0], masks_list[b].shape[0],
+                    )
+                    if corr is not None:
+                        pair_corrs[(a, b)] = corr
+                        pair_indices.append((a, b))
+
+            if len(pair_indices) >= self.min_pairs_per_tuple:
+                break
+        else:
+            # All retries exhausted — fall back to pairwise (seed pair only)
+            group = [seed_i, seed_j]
+            images = []
+            masks_list = []
+            for frame_idx in group:
+                img, masks = self._load_frame(frame_idx)
+                images.append(img)
+                masks_list.append(masks)
+            # Pad to n_frames with duplicates of frame 0
+            while len(images) < self.n_frames:
+                images.append(images[0].clone())
+                masks_list.append(masks_list[0].clone())
+            pair_corrs = {}
+            pair_indices = []
+            corr = self._load_pair_corr(
+                seed_i, seed_j,
+                masks_list[0].shape[0], masks_list[1].shape[0],
+            )
+            if corr is not None:
+                pair_corrs[(0, 1)] = corr
+                pair_indices.append((0, 1))
+
+        # Subsample pairs if exceeding max
+        if len(pair_indices) > self.max_pairs_per_tuple:
+            sampled = random.sample(pair_indices, self.max_pairs_per_tuple)
+            pair_corrs = {k: pair_corrs[k] for k in sampled}
+            pair_indices = sampled
+
+        return {
+            "images": images,             # list[N] of (3, H, W)
+            "masks_list": masks_list,     # list[N] of (M_k, H, W)
+            "pair_corrs": pair_corrs,     # dict {(a,b): (K, 2)}
+            "pair_indices": pair_indices,  # list of (a, b)
+        }
+
+
+def collate_fn_tuple(batch):
+    """Collate for ScanNetPPTupleDataset: stack images, keep masks/corrs as lists."""
+    N = len(batch[0]["images"])
+    return {
+        # (B, N, 3, H, W)
+        "images": torch.stack([
+            torch.stack(b["images"]) for b in batch
+        ]),
+        # list[B] of list[N] of (M_k, H, W)
+        "masks_list": [b["masks_list"] for b in batch],
+        # list[B] of dict {(a,b): (K, 2)}
+        "pair_corrs": [b["pair_corrs"] for b in batch],
+        # union of all pair indices across batch
+        "pair_indices": _merge_pair_indices([b["pair_indices"] for b in batch]),
+    }
+
+
+def _merge_pair_indices(batch_pair_indices: list[list[tuple]]) -> list[tuple]:
+    """Deduplicate pair indices across batch samples."""
+    seen = set()
+    for indices in batch_pair_indices:
+        for pair in indices:
+            seen.add(pair)
+    return sorted(seen)

@@ -37,10 +37,10 @@ FEATURE_MATCHER:
     DUSTBIN_SCORE_INIT: 1.0
 
 DATASET:
-  METADATA_PATH: /mnt/vol1/datasets/ScanNet++/scannetpp_processed/all_metadata.npz
-  DATA_ROOT:     /mnt/vol1/datasets/ScanNet++/scannetpp_processed
-  SEGDATA_ROOT:  /mnt/vol1/datasets/ScanNet++/masks_resize_mast3r
-  PAIRS_ROOT:    /mnt/vol1/datasets/ScanNet++/masks_resize_mast3r_res
+  METADATA_PATH: /mnt/vol2_raid/shared/datasets/ScanNet++/scannetpp_processed/all_metadata.npz
+  DATA_ROOT:     /mnt/vol2_raid/shared/datasets/ScanNet++/scannetpp_processed
+  SEGDATA_ROOT:  /mnt/vol2_raid/shared/datasets/ScanNet++/masks_resize_mast3r
+  PAIRS_ROOT:    /mnt/vol2_raid/shared/datasets/ScanNet++/masks_resize_mast3r_res
   HEIGHT: 336
   WIDTH:  512
   RESIZE_MODE: square
@@ -49,7 +49,7 @@ DATASET:
   PAIR_DSC_ROOT: ""
 
 TRAINING:
-  BATCH_SIZE:      20
+  BATCH_SIZE:      48
   NUM_WORKERS:     8
   PREFETCH_FACTOR: 1
   LR:              0.0001
@@ -64,7 +64,7 @@ TRAINING:
   SAVE_INTERVAL:   7000
 
 DEBUG: false
-SAVE_DIR: results/segvggt_dpt_v3
+SAVE_DIR: results/segvggt_dpt/v3-001
 RESUME:   null
 
 ACCELERATE:

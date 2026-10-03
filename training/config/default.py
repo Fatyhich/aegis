@@ -16,6 +16,8 @@ _CN.MODEL.VGGT_LAYER_INDICES = (5, 11, 17, 23)  # multi-layer extraction for DPT
 _CN.MODEL.VGGT_FUSION_DIM    = 256              # DPT fusion output dim (D_hat)
 _CN.MODEL.MATCHABILITY_BIAS  = 0.0             # init bias for matchability logit (>0 → less dustbin)
 _CN.MODEL.TEMPERATURE_INIT   = 1.0             # learnable temperature init (1.0 = neutral)
+_CN.MODEL.N_JOINT_LAYERS     = 3              # joint multi-frame attention layers (multiframe arch)
+_CN.MODEL.MAX_FRAMES         = 16             # max frames for learnable frame embeddings
 
 # LightGlue-style architecture params (MODEL.ARCH = "lightglue")
 _CN.MODEL.LG = CN()
@@ -56,6 +58,11 @@ _CN.DATASET.RESIZE_MODE   = "square"    # square | longest_side
 _CN.DATASET.VAL_FRACTION          = 0.02
 _CN.DATASET.MAX_PAIRS     = 0   # 0 = use all pairs; >0 = cap dataset size (before train/val split)
 _CN.DATASET.PAIR_DSC_ROOT = ""  # per-pair precomputed descriptors; "" = online backbone
+# Multi-frame tuple settings (used by vggt_dpt_multiframe arch)
+_CN.DATASET.N_FRAMES              = 2    # number of frames per tuple (>=2)
+_CN.DATASET.MIN_PAIRS_PER_TUPLE   = 2    # minimum GT pairs required in a tuple
+_CN.DATASET.MAX_PAIRS_PER_TUPLE   = 6    # subsample if more GT pairs available
+_CN.DATASET.RANDOM_NEIGHBOR_PROB  = 0.2  # probability of random (vs greedy) expansion
 
 # ── Training ──────────────────────────────────────────────────────
 _CN.TRAINING = CN()

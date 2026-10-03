@@ -28,10 +28,23 @@ from tqdm import tqdm
 from collections import defaultdict
 import numpy as np
 
-from datasets.replica_dataset import ReplicaSegmentMatchDataset, collate_fn, load_pairs_from_json
-from core.model_infer import MASt3RSegFeatInfer
+from datasets.replica_dataset import (
+    ReplicaSegmentMatchDataset,
+    collate_fn,
+    collate_fn_tuple,
+    load_pairs_from_json,
+)
+from core.model_infer import (
+    MASt3RSegFeatInfer,
+    SegMASt3RLGv2Infer,
+    SegVGGTDPTInfer,
+    SegVGGTDPTJointInfer,
+    SegVGGTInfer,
+    pad_masks_to_batch,
+)
 from core.ground_truth_generator import generate_instance_correspondences
 from core.eval_metrics import compute_metrics, aggregate_metrics_by_bin, print_table2_format
+from core.vis_utils import visualize_match_pair, visualize_match_tuple, visualize_score_heatmap
 
 
 def load_config(config_path: str) -> dict:
@@ -41,7 +54,7 @@ def load_config(config_path: str) -> dict:
     return config
 
 
-def setup_model(cfg: dict, device: torch.device) -> MASt3RSegFeatInfer:
+def setup_model(cfg: dict, device: torch.device):
     """
     Initialize model and load checkpoint.
 
@@ -53,11 +66,50 @@ def setup_model(cfg: dict, device: torch.device) -> MASt3RSegFeatInfer:
         Initialized model ready for inference
     """
     print("Initializing model...")
+    arch = cfg['MODEL'].get('ARCH', 'mast3r').lower()
 
-    # Create model
+    if arch == 'segvggt_dpt':
+        model = SegVGGTDPTInfer(cfg)
+        model.prepare(device)
+        print("SegVGGTDPT loaded successfully!")
+        return model
+
+    if arch == 'segvggt_dpt_joint':
+        model = SegVGGTDPTJointInfer(cfg)
+        model.prepare(device)
+        print("SegVGGTDPTJoint loaded successfully!")
+        return model
+
+    if arch == 'roma':
+        from core.roma_infer import RoMaSegInfer
+        mc = cfg['MODEL']
+        model = RoMaSegInfer(
+            variant=mc.get('ROMA_VARIANT', 'indoor'),
+            num_samples=mc.get('ROMA_NUM_SAMPLES', 5000),
+            certainty_threshold=mc.get('ROMA_CERTAINTY', 0.0),
+            upsample=mc.get('ROMA_UPSAMPLE', False),
+            scoring=mc.get('ROMA_SCORING', 'certainty'),
+        )
+        model.prepare(device)
+        print(f"RoMa loaded successfully (scoring={model.scoring}, "
+              f"upsample={model.upsample})")
+        return model
+
+    if arch == 'segvggt':
+        model = SegVGGTInfer(cfg)
+        model.prepare(device)
+        print("SegVGGT loaded successfully!")
+        return model
+
+    if arch == 'lightglue_v2':
+        model = SegMASt3RLGv2Infer(cfg)
+        model.prepare(device)
+        print("SegMASt3RLGv2 loaded successfully!")
+        return model
+
+    # Default: MASt3R + Sinkhorn
     model = MASt3RSegFeatInfer(cfg)
 
-    # Load checkpoint
     checkpoint_path = cfg['MODEL']['CHECKPOINT']
     if not Path(checkpoint_path).exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -65,7 +117,6 @@ def setup_model(cfg: dict, device: torch.device) -> MASt3RSegFeatInfer:
     print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    # Load state dict
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     elif 'state_dict' in checkpoint:
@@ -73,85 +124,128 @@ def setup_model(cfg: dict, device: torch.device) -> MASt3RSegFeatInfer:
     else:
         model.load_state_dict(checkpoint)
 
-    # Prepare model for inference
     model.prepare(device)
-
     print("Model loaded successfully!")
     return model
 
 
 def evaluate_batch(
-    model: MASt3RSegFeatInfer,
+    model,
     batch: dict,
-    device: torch.device
-) -> dict:
+    device: torch.device,
+    vis_dir: Path = None,
+    vis_counter: list = None,
+    num_vis: int = 20,
+    num_examples_per_pair: int = 5,
+) -> list:
     """
     Evaluate a single batch and compute metrics.
 
     Args:
-        model: Initialized model
+        model: Initialized model (MASt3RSegFeatInfer or SegVGGTDPTInfer)
         batch: Batch dictionary from dataloader
         device: Device for computation
+        vis_dir: If set, save match visualizations here
+        vis_counter: Mutable [int] tracking total visualizations saved
+        num_vis: Max total visualization pairs to save
+        num_examples_per_pair: GT match rows to show per pair image
 
     Returns:
-        Dictionary with metrics for each sample in batch
+        List of dicts with 'pose_bin' and 'metrics' keys
     """
-    # Extract batch data
-    img0 = batch['img0'].to(device)  # (B, 3, H, W)
-    img1 = batch['img1'].to(device)  # (B, 3, H, W)
-    masks0_list = batch['masks0']  # List of (M_i, H, W) tensors
-    masks1_list = batch['masks1']  # List of (N_i, H, W) tensors
+    img0 = batch['img0'].to(device)
+    img1 = batch['img1'].to(device)
+    masks0_list = batch['masks0']
+    masks1_list = batch['masks1']
     instance_ids0_list = batch['instance_ids0']
     instance_ids1_list = batch['instance_ids1']
     pose_bins = batch['pose_bin']
 
-    batch_size = img0.shape[0]
+    is_tuple_mode = hasattr(model, 'infer_tuple')
+    if is_tuple_mode:
+        images_bnchw = batch['images'].to(device)
+        masks_nested = batch['masks']
+        N = batch['n_frames']
+        B = images_bnchw.shape[0]
+        masks_per_view = [
+            pad_masks_to_batch([masks_nested[b][v] for b in range(B)], device)
+            for v in range(N)
+        ]
+
     results = []
 
-    # Process each sample in batch
-    for i in range(batch_size):
-        # Get single sample
-        img0_single = img0[i:i+1]  # (1, 3, H, W)
-        img1_single = img1[i:i+1]  # (1, 3, H, W)
-        masks0_single = masks0_list[i].unsqueeze(0).to(device)  # (1, M, H, W)
-        masks1_single = masks1_list[i].unsqueeze(0).to(device)  # (1, N, H, W)
+    for i in range(img0.shape[0]):
+        img0_single = img0[i:i+1]
+        img1_single = img1[i:i+1]
+        masks0_single = masks0_list[i].unsqueeze(0).to(device)
+        masks1_single = masks1_list[i].unsqueeze(0).to(device)
         instance_ids0 = instance_ids0_list[i]
         instance_ids1 = instance_ids1_list[i]
         pose_bin = pose_bins[i]
 
-        # Skip if no masks in either frame
         if len(instance_ids0) == 0 or len(instance_ids1) == 0:
-            results.append({
-                'pose_bin': pose_bin,
-                'metrics': {
-                    'AUPRC': 0.0,
-                    'R@1': 0.0,
-                    'R@5': 0.0,
-                    'num_queries': 0
-                }
-            })
+            results.append({'pose_bin': pose_bin,
+                            'metrics': {'AUPRC': 0.0, 'R@1': 0.0, 'R@5': 0.0, 'num_queries': 0}})
             continue
 
-        # Run model inference
         with torch.no_grad():
-            match_result, scores = model.infer_pair(
-                img0_single, img1_single, masks0_single, masks1_single
-            )
-            # match_result: (1, M), scores: (1, M, N)
+            if is_tuple_mode:
+                images_s = images_bnchw[i:i+1]
+                masks_s = [mv[i:i+1] for mv in masks_per_view]
+                _, scores = model.infer_tuple(images_s, masks_s)
+                M0 = masks0_single.shape[1]
+                M1 = masks1_single.shape[1]
+                scores = scores[:, :M0, :M1]
+            else:
+                match_result, scores = model.infer_pair(
+                    img0_single, img1_single, masks0_single, masks1_single
+                )
 
-        # Convert to numpy
-        scores_np = scores[0].cpu().numpy()  # (M, N)
-
-        # Generate ground truth correspondences
-        gt_matrix = generate_instance_correspondences(instance_ids0, instance_ids1)  # (M, N)
-
-        # Compute metrics
+        scores_np = scores[0].cpu().numpy()       # (M, N)
+        gt_matrix = generate_instance_correspondences(instance_ids0, instance_ids1)
         metrics = compute_metrics(scores_np, gt_matrix)
+        results.append({'pose_bin': pose_bin, 'metrics': metrics})
 
-        results.append({
-            'pose_bin': pose_bin,
-            'metrics': metrics
-        })
+        # Visualizations
+        if vis_dir is not None and vis_counter is not None and vis_counter[0] < num_vis:
+            scene = batch['scene'][i] if 'scene' in batch else ''
+            idx0 = batch['idx0'][i] if 'idx0' in batch else vis_counter[0]
+            idx1 = batch['idx1'][i] if 'idx1' in batch else ''
+            pair_title = f"{scene}  {idx0}→{idx1}  bin={pose_bin}"
+
+            if is_tuple_mode:
+                frame_indices = batch['frame_indices'][i]
+                tuple_title = pair_title + f"  tuple={frame_indices}"
+                visualize_match_tuple(
+                    batch['images'][i],
+                    batch['masks'][i],
+                    batch['instance_ids'][i],
+                    scores_np, gt_matrix,
+                    save_path=vis_dir / f"tuple_{vis_counter[0]:04d}_matches.png",
+                    num_examples=num_examples_per_pair,
+                    title=tuple_title,
+                )
+            else:
+                vis_path = vis_dir / f"pair_{vis_counter[0]:04d}_matches.png"
+                visualize_match_pair(
+                    img0_single[0], img1_single[0],
+                    masks0_list[i], masks1_list[i],
+                    instance_ids0, instance_ids1,
+                    scores_np, gt_matrix,
+                    save_path=vis_path,
+                    num_examples=num_examples_per_pair,
+                    title=pair_title,
+                )
+
+            heat_path = vis_dir / f"pair_{vis_counter[0]:04d}_heatmap.png"
+            visualize_score_heatmap(
+                img0_single[0], img1_single[0],
+                scores_np, gt_matrix,
+                save_path=heat_path,
+                title=pair_title,
+            )
+
+            vis_counter[0] += 1
 
     return results
 
@@ -176,6 +270,23 @@ def main():
         default="cuda",
         choices=["cuda", "cpu"],
         help="Device to use for inference"
+    )
+    parser.add_argument(
+        "--num_pairs",
+        type=int,
+        default=None,
+        help="Limit evaluation to first N pairs (for smoke testing)"
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Save match visualizations to output_dir/visualizations/"
+    )
+    parser.add_argument(
+        "--num_vis",
+        type=int,
+        default=30,
+        help="Max number of pair visualizations to save (default 30)"
     )
 
     args = parser.parse_args()
@@ -205,7 +316,11 @@ def main():
         )
 
     pairs = load_pairs_from_json(pairs_file)
-    print(f"Loaded {len(pairs)} pairs from {pairs_file}")
+    if args.num_pairs is not None:
+        pairs = pairs[:args.num_pairs]
+        print(f"Loaded {len(pairs)} pairs (limited to {args.num_pairs}) from {pairs_file}")
+    else:
+        print(f"Loaded {len(pairs)} pairs from {pairs_file}")
 
     # Print distribution by pose bin
     bin_names = [f"{b[0]}-{b[1]}" for b in cfg['EVAL']['POSE_BINS']]
@@ -218,16 +333,20 @@ def main():
         print(f"  {bin_name}°: {count} pairs")
 
     # Create dataset
+    n_frames = int(cfg['EVAL'].get('N_FRAMES', 2))
+    context_step = int(cfg['EVAL'].get('CONTEXT_STEP', 5))
     dataset = ReplicaSegmentMatchDataset(
         data_root=cfg['DATASET']['DATA_ROOT'],
         instance_mask_root=cfg['DATASET']['INSTANCE_MASK_ROOT'],
         pairs=pairs,
         target_h=cfg['DATASET']['RESIZE_H'],
         target_w=cfg['DATASET']['RESIZE_W'],
-        m_prime=cfg['DATASET'].get('M_PRIME', None)
+        m_prime=cfg['DATASET'].get('M_PRIME', None),
+        n_frames=n_frames,
+        context_step=context_step,
     )
 
-    print(f"\nDataset size: {len(dataset)}")
+    print(f"\nDataset size: {len(dataset)}  (n_frames={n_frames}, context_step={context_step})")
 
     # Create dataloader
     dataloader = DataLoader(
@@ -235,7 +354,7 @@ def main():
         batch_size=cfg['EVAL']['BATCH_SIZE'],
         shuffle=False,
         num_workers=cfg['EVAL']['NUM_WORKERS'],
-        collate_fn=collate_fn
+        collate_fn=collate_fn_tuple if n_frames >= 2 else collate_fn,
     )
 
     print(f"Batch size: {cfg['EVAL']['BATCH_SIZE']}")
@@ -243,6 +362,14 @@ def main():
 
     # Setup model
     model = setup_model(cfg, device)
+
+    # Visualization setup
+    vis_dir = None
+    vis_counter = [0]
+    if args.visualize:
+        vis_dir = output_dir / "visualizations"
+        vis_dir.mkdir(exist_ok=True)
+        print(f"Visualizations → {vis_dir}  (max {args.num_vis} pairs)")
 
     # Run evaluation
     print("\n" + "="*80)
@@ -252,7 +379,12 @@ def main():
     results_by_bin = defaultdict(list)
 
     for batch in tqdm(dataloader, desc="Evaluating"):
-        batch_results = evaluate_batch(model, batch, device)
+        batch_results = evaluate_batch(
+            model, batch, device,
+            vis_dir=vis_dir,
+            vis_counter=vis_counter,
+            num_vis=args.num_vis,
+        )
 
         # Accumulate results by pose bin
         for result in batch_results:

@@ -1,3 +1,6 @@
 [submodule "third_party/segmast3r"]
 	path = third_party/segmast3r
 	url = git@github.com:SegMASt3R/segmast3r.git
+[submodule "third_party/vggt"]
+	path = third_party/vggt
+	url = https://github.com/facebookresearch/vggt.git

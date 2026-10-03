@@ -16,7 +16,7 @@ from PIL.ImageOps import exif_transpose
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
-from ground_truth_generator import instance_img_to_binary_masks, load_instance_mask
+from core.ground_truth_generator import instance_img_to_binary_masks, load_instance_mask
 
 
 # Normalize to [-1, 1] range (same as paired_data_interface.py)
@@ -78,7 +78,9 @@ class ReplicaSegmentMatchDataset(Dataset):
         pairs: List[Dict],
         target_h: int = 336,
         target_w: int = 512,
-        m_prime: Optional[int] = None
+        m_prime: Optional[int] = None,
+        n_frames: int = 2,
+        context_step: int = 5,
     ):
         """
         Args:
@@ -89,6 +91,9 @@ class ReplicaSegmentMatchDataset(Dataset):
             target_h: Target height for resizing
             target_w: Target width for resizing
             m_prime: Maximum number of masks to keep per image (None = keep all)
+            n_frames: Number of frames per sample. If > 2, adds N-2 temporal
+                context frames from the same scene (deterministic).
+            context_step: Frame-index step for temporal context sampling.
         """
         self.data_root = Path(data_root)
         self.instance_mask_root = Path(instance_mask_root)
@@ -96,9 +101,53 @@ class ReplicaSegmentMatchDataset(Dataset):
         self.target_h = target_h
         self.target_w = target_w
         self.m_prime = m_prime
+        self.n_frames = n_frames
+        self.context_step = context_step
+        self._scene_frames: Dict[str, List[int]] = {}
+        self._short_scene_warned = 0
 
     def __len__(self):
         return len(self.pairs)
+
+    def _scene_frame_list(self, scene: str) -> List[int]:
+        """Return sorted list of available RGB frame indices for `scene`."""
+        if scene in self._scene_frames:
+            return self._scene_frames[scene]
+        rgb_dir = self.data_root / scene / "Sequence_1" / "rgb"
+        indices = []
+        if rgb_dir.is_dir():
+            for p in rgb_dir.glob("rgb_*.png"):
+                try:
+                    indices.append(int(p.stem.split("_")[1]))
+                except (ValueError, IndexError):
+                    continue
+        indices.sort()
+        self._scene_frames[scene] = indices
+        return indices
+
+    def _sample_context(
+        self, scene_frames: List[int], idx0: int, idx1: int, n_context: int
+    ) -> List[int]:
+        if n_context <= 0:
+            return []
+        step = self.context_step
+        mid = (idx0 + idx1) // 2
+        available = set(scene_frames) - {idx0, idx1}
+        picked: List[int] = []
+        for k in range(1, n_context * 4 + 1):
+            for offset in (-k * step, k * step):
+                cand = mid + offset
+                if cand in available and cand not in picked:
+                    picked.append(cand)
+                    if len(picked) == n_context:
+                        return picked
+        if self._short_scene_warned < 10:
+            print(f"  [warn] short replica scene: only {len(picked)} context frames "
+                  f"for query ({idx0}, {idx1}); padding with idx0={idx0}")
+            self._short_scene_warned += 1
+        while len(picked) < n_context:
+            picked.append(idx0)
+        return picked
 
     def _get_rgb_path(self, scene: str, idx: int) -> Path:
         """Get path to RGB image."""
@@ -197,7 +246,7 @@ class ReplicaSegmentMatchDataset(Dataset):
         masks0, instance_ids0 = self._load_masks(mask0_path, (self.target_h, self.target_w))
         masks1, instance_ids1 = self._load_masks(mask1_path, (self.target_h, self.target_w))
 
-        return {
+        base = {
             'img0': img0,
             'img1': img1,
             'masks0': masks0,
@@ -210,6 +259,33 @@ class ReplicaSegmentMatchDataset(Dataset):
             'idx0': idx0,
             'idx1': idx1
         }
+
+        if self.n_frames < 2:
+            return base
+
+        scene_frames = self._scene_frame_list(scene)
+        ctx_indices = self._sample_context(
+            scene_frames, idx0, idx1, self.n_frames - 2
+        )
+        images = [img0, img1]
+        masks = [masks0, masks1]
+        instance_ids = [instance_ids0, instance_ids1]
+        frame_indices = [idx0, idx1]
+        size_hw = (self.target_h, self.target_w)
+        for cidx in ctx_indices:
+            images.append(self._load_image(self._get_rgb_path(scene, cidx)))
+            m, iid = self._load_masks(self._get_instance_mask_path(scene, cidx), size_hw)
+            masks.append(m)
+            instance_ids.append(iid)
+            frame_indices.append(cidx)
+
+        base.update({
+            'images': images,
+            'masks': masks,
+            'instance_ids': instance_ids,
+            'frame_indices': frame_indices,
+        })
+        return base
 
 
 def collate_fn(batch: List[Dict]) -> Dict:
@@ -260,6 +336,33 @@ def collate_fn(batch: List[Dict]) -> Dict:
         'scene': scene,
         'idx0': idx0,
         'idx1': idx1
+    }
+
+
+def collate_fn_tuple(batch: List[Dict]) -> Dict:
+    """
+    Multi-frame tuple collate. See VKitti2SegmentMatchDataset.collate_fn_tuple
+    for layout: stacks images into (B, N, 3, H, W); keeps masks / ids as lists.
+    """
+    N = len(batch[0]['images'])
+    images = torch.stack([torch.stack(item['images'], dim=0) for item in batch], dim=0)
+    return {
+        'images': images,
+        'masks': [item['masks'] for item in batch],
+        'instance_ids': [item['instance_ids'] for item in batch],
+        'frame_indices': [item['frame_indices'] for item in batch],
+        'img0': torch.stack([item['img0'] for item in batch]),
+        'img1': torch.stack([item['img1'] for item in batch]),
+        'masks0': [item['masks0'] for item in batch],
+        'masks1': [item['masks1'] for item in batch],
+        'instance_ids0': [item['instance_ids0'] for item in batch],
+        'instance_ids1': [item['instance_ids1'] for item in batch],
+        'pose_bin': [item['pose_bin'] for item in batch],
+        'angle': [item['angle'] for item in batch],
+        'scene': [item['scene'] for item in batch],
+        'idx0': [item['idx0'] for item in batch],
+        'idx1': [item['idx1'] for item in batch],
+        'n_frames': N,
     }
 
 
